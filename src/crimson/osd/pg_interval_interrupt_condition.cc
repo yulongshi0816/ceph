@@ -25,6 +25,7 @@ IOInterruptCondition::~IOInterruptCondition() {
 
 bool IOInterruptCondition::new_interval_created() {
   LOG_PREFIX(IOInterruptCondition::new_interval_created);
+  // PG 当前 interval 开始的 epoch
   const epoch_t interval_start = pg->get_interval_start_epoch();
   bool ret = epoch_started < interval_start;
   if (ret) {

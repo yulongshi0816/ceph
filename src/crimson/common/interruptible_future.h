@@ -600,16 +600,16 @@ private:
   auto handle_interruption(Func&& func) {
     return core_type::then_wrapped(
       [func=std::move(func)](auto&& fut) mutable {
-	if (fut.failed()) {
-	  std::exception_ptr ex = fut.get_exception();
-	  if (InterruptCond::is_interruption(ex)) {
-	    return seastar::futurize_invoke(std::move(func), std::move(ex));
-	  } else {
-	    return seastar::make_exception_future<T>(std::move(ex));
-	  }
-	} else {
-	  return seastar::make_ready_future<T>(fut.get());
-	}
+        if (fut.failed()) {
+          std::exception_ptr ex = fut.get_exception();
+          if (InterruptCond::is_interruption(ex)) {
+            return seastar::futurize_invoke(std::move(func), std::move(ex));
+          } else {
+            return seastar::make_exception_future<T>(std::move(ex));
+          }
+        } else {
+          return seastar::make_ready_future<T>(fut.get());
+        }
       });
   }
 

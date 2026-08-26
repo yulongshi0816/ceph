@@ -56,36 +56,38 @@ TEST_F(seastar_test_suite_t, basic)
   run_async([] {
     interruptor::with_interruption(
       [] {
-	ceph_assert(interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
-	return interruptor::make_interruptible(seastar::now())
-	.then_interruptible([] {
-	  ceph_assert(interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
-	}).then_interruptible([] {
-	  ceph_assert(interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
-	  return errorator<ct_error::enoent>::make_ready_future<>();
-	}).safe_then_interruptible([] {
-	  ceph_assert(interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
-	  return seastar::now();
-	}, errorator<ct_error::enoent>::all_same_way([] {
-	  ceph_assert(interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
-	  return seastar::now();
-	  })
-	);
-      }, [](std::exception_ptr) {}, false).get();
+        ceph_assert(interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
+        // 创建一个立即成功的普通 future
+        // → 把它包装成可中断 future
+        // → 成功后准备运行第一个可中断 continuation
+        return interruptor::make_interruptible(seastar::now())
+        .then_interruptible([] {
+          ceph_assert(interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
+        }).then_interruptible([] {
+          // 断言的作用，当前continuation确实携带着中断条件
+          ceph_assert(interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
+          return errorator<ct_error::enoent>::make_ready_future<>();
+        }).safe_then_interruptible([] {
+          ceph_assert(interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
+          return seastar::now(); // 成功处理函数
+        }, errorator<ct_error::enoent>::all_same_way([] {
+          ceph_assert(interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
+          return seastar::now(); // 错误处理函数
+          })
+        );
+      }, [](std::exception_ptr) {}, false).get();// get 等待future完成，并检查最终成功或失败
 
     interruptor::with_interruption(
       [] {
-	ceph_assert(interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
-	return interruptor::make_interruptible(seastar::now())
-	.then_interruptible([] {
-	  ceph_assert(interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
-	});
+        ceph_assert(interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
+        return interruptor::make_interruptible(seastar::now())
+        .then_interruptible([] {
+          ceph_assert(interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
+        });
       }, [](std::exception_ptr) {
-	ceph_assert(!interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
-	return seastar::now();
+        ceph_assert(!interruptible::interrupt_cond<TestInterruptCondition>.interrupt_cond);
+        return seastar::now();
       }, true).get();
-
-
   });
 }
 
@@ -209,7 +211,7 @@ TEST_F(seastar_test_suite_t, errorated)
   run_async([] {
     base_ertr::future<> ret = with_intr(
       []() {
-	return base_iertr::now();
+	      return base_iertr::now();
       }
     );
     ret.unsafe_get();
@@ -277,16 +279,21 @@ TEST_F(seastar_test_suite_t, interruptible_yield)
   run_async([] {
     bool interrupted = false;
     auto fut = interruptor::with_interruption([] {
+      std::cout << "1. opfunc started" << std::endl;
       return interruptor::async([] {
+        std::cout << "2. before set_interrupt" << std::endl;
         interruptible::interrupt_cond<
-	  TestInterruptCondition>.interrupt_cond->set_interrupt();
+	        TestInterruptCondition>.interrupt_cond->set_interrupt();
+        std::cout << "3. after set_interrupt" << std::endl;
+        std::cout << "4. before interruptor::yield" << std::endl;
         interruptor::yield();
         // the execution should be interrupted, the run should
         // never reach here.
+        std::cout << "5. after interruptor::yield" << std::endl;
         ceph_abort();
       });
     }, [&interrupted](std::exception_ptr) {
-      std::cout << "interrupted" << std::endl;
+      std::cout << "6. interrupted handler" << std::endl;
       interrupted = true;
     }, false);
     fut.wait();
@@ -297,7 +304,10 @@ TEST_F(seastar_test_suite_t, interruptible_yield)
       return interruptor::async([] {
         interruptible::interrupt_cond<
 	  TestInterruptCondition>.interrupt_cond->set_interrupt();
-        interruptor::green_get(seastar::yield());
+        // 当前任务暂时让出 Reactor
+        // 让其他任务有机会运行
+        // 之后再回来继续
+        interruptor::green_get(seastar::yield()); 
         // the execution should be interrupted, the run should
         // never reach here.
         ceph_abort();
@@ -384,5 +394,36 @@ TEST_F(seastar_test_suite_t, handle_error)
 	});
       });
     ret.unsafe_get();
+  });
+}
+
+TEST_F(seastar_test_suite_t, interruption_to_eagain) 
+{
+  run_async([]{
+    auto ret = 
+      base_intr::with_interruption_to_error<ct_error::eagain
+      >(
+        [] {
+          std::cout << "OPFUNC: should not run" << std::endl;
+          return base_iertr::now();
+        },
+        TestInterruptCondition(true)
+      );
+
+      std::move(ret).handle_error(
+        ct_error::enoent::handle(
+          [](const auto&) {
+            std::cout << "ERROR: unexpectded enoent" << std::endl;
+            return seastar::now();
+          }
+        ),
+
+      ct_error::eagain::handle(
+        [](const auto&) {
+          std::cout << "ERROR: handled egain" << std::endl;
+          return seastar::now();
+        }
+      )
+    ).get();
   });
 }

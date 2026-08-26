@@ -10,17 +10,45 @@
 #include "crimson/common/errorator-utils.h"
 #include "crimson/common/log.h"
 #include "seastar/core/sleep.hh"
+#include <iostream>
+
 
 struct errorator_test_t : public seastar_test_suite_t {
-  using ertr = crimson::errorator<crimson::ct_error::invarg>;
+  using ertr = crimson::errorator<crimson::ct_error::invarg>; // 参数无效
+  using two_error_ertr = crimson::errorator<crimson::ct_error::invarg,
+                                            crimson::ct_error::enoent>; 
 
   ertr::future<> invarg_foo() {
+    // 表示产生一个 invarg 错误
     return crimson::ct_error::invarg::make();
   };
 
   ertr::future<> clean_foo() {
     return ertr::now();
   };
+
+  two_error_ertr::future<> two_error_foo(bool invalid) {
+    if(invalid) {
+      return crimson::ct_error::invarg::make();
+    }
+
+    return crimson::ct_error::enoent::make();
+  }
+
+  using enoent_ertr = crimson::errorator<
+        crimson::ct_error::enoent>;
+
+  enoent_ertr::future<> handle_invarg_only(bool invalid) {
+    return two_error_foo(invalid).handle_error(
+      crimson::ct_error::invarg::handle(
+        [](const auto&) {
+          fmt::print("INNER: handled invarg\n");
+          return seastar::now();
+        }
+      ),
+      crimson::ct_error::enoent::pass_further{}
+    );
+  }
 
   struct noncopyable_t {
     constexpr noncopyable_t() = default;
@@ -103,6 +131,31 @@ TEST_F(errorator_test_t, no_handle_error)
   });
 }
 
+TEST_F(errorator_test_t, trace_failed_path) 
+{
+  run_async([this] {
+    return invarg_foo()
+      .safe_then([] {
+        std::cout << "SAFE_THEN: suceess path\n";
+        return ertr::make_ready_future<int>(42);
+      })
+      .safe_then([](int value) {
+        std::cout << "VALUE: " << value << "\n";
+        return seastar::now();
+      })
+      .handle_error(
+        crimson::ct_error::invarg::handle(
+          [](const auto& ec) {
+            std::cout << "ERROR: " << ec.message() << '\n';
+            return seastar::now();
+          }
+        ),
+        crimson::ct_error::assert_all("unexpected error")
+      )
+      .get();
+  });
+}
+
 TEST_F(errorator_test_t, handle_specific_error)
 {
   int res = 0;
@@ -110,7 +163,7 @@ TEST_F(errorator_test_t, handle_specific_error)
   return invarg_foo().handle_error(
     crimson::ct_error::invarg::handle([&res] (const auto& ec) {
       EXPECT_EQ(ec.value(), EINVAL);
-      res = 1;
+      res = 1; // handle确实执行了
       return seastar::now();
     }),
     crimson::ct_error::assert_all("unexpected error")).get();
@@ -132,4 +185,41 @@ TEST_F(errorator_test_t, pass_further_error)
     crimson::ct_error::assert_all("unexpected error")).get();
   });
   EXPECT_EQ(res, 1);
+}
+
+
+TEST_F(errorator_test_t, exhaustive_error_handler) {
+  run_async([this] {
+    return two_error_foo(false)
+            .handle_error(
+              crimson::ct_error::invarg::handle(
+                [](const auto&) {
+                  fmt::print("HANDLED: invarg\n");
+                  return seastar::now();
+              }
+            ),
+            crimson::ct_error::enoent::handle(
+              [](const auto&) {
+                fmt::print("HANDLED: enoent\n");
+                return seastar::now();
+              }
+            )
+          )
+        .get();
+    });
+}
+
+TEST_F(errorator_test_t, partially_handle_error) {
+  run_async([this] {
+    return handle_invarg_only(false)
+        .handle_error(
+            crimson::ct_error::enoent::handle(
+              [](const auto&) {
+                fmt::print("OUTER: handled enoent\n");
+                return seastar::now();
+              }
+            )
+        )
+      .get();
+  });
 }

@@ -18,10 +18,12 @@ macro(check_nasm_support _object_format _support_x64 _support_x64_and_avx2 _supp
       " ${_support_x64})
       set(CMAKE_REQUIRED_QUIET ${save_quiet})
       if(${_support_x64})
+        set(nasm_test_output
+          ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/check_nasm_support.o)
         execute_process(COMMAND nasm -f ${object_format} -i
           ${CMAKE_SOURCE_DIR}/src/isa-l/include/
           ${CMAKE_SOURCE_DIR}/src/isa-l/erasure_code/gf_vect_dot_prod_avx2.asm
-          -o /dev/null
+          -o ${nasm_test_output}
           RESULT_VARIABLE rc
           OUTPUT_QUIET
           ERROR_QUIET)
@@ -31,7 +33,7 @@ macro(check_nasm_support _object_format _support_x64 _support_x64_and_avx2 _supp
         execute_process(COMMAND nasm -D HAVE_AS_KNOWS_AVX512 -f ${object_format}
           -i ${CMAKE_SOURCE_DIR}/src/isa-l/include/
           ${CMAKE_SOURCE_DIR}/src/isa-l/erasure_code/gf_vect_dot_prod_avx512.asm
-          -o /dev/null
+          -o ${nasm_test_output}
           RESULT_VARIABLE rt
           OUTPUT_QUIET
           ERROR_QUIET)
@@ -41,13 +43,14 @@ macro(check_nasm_support _object_format _support_x64 _support_x64_and_avx2 _supp
 	execute_process(COMMAND nasm -D AS_FEATURE_LEVEL=10 -f ${object_format}
           -i ${CMAKE_SOURCE_DIR}/src/isa-l/include/
           ${CMAKE_SOURCE_DIR}/src/isa-l/crc/crc32_iscsi_by16_10.asm
-          -o /dev/null
+          -o ${nasm_test_output}
           RESULT_VARIABLE rt
           OUTPUT_QUIET
           ERROR_QUIET)
         if(NOT rt)
           set(${_support_x64_and_avx512_vpclmul} TRUE)
         endif()
+        file(REMOVE ${nasm_test_output})
       endif(${_support_x64})
     endif(CMAKE_SYSTEM_PROCESSOR MATCHES "amd64|x86_64")
   endif(NOT no_nasm)

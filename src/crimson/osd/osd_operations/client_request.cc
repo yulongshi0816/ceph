@@ -253,22 +253,23 @@ seastar::future<> ClientRequest::with_pg_process(
   return interruptor::with_interruption(
     [FNAME, this, pgref, this_instance_id, &ihref]() mutable {
       return with_pg_process_interruptible(
-	pgref, this_instance_id, ihref
+	      pgref, this_instance_id, ihref
       ).then_interruptible([FNAME, this, this_instance_id, pgref] {
-	DEBUGDPP("{}.{}: with_pg_process_interruptible complete,"
-		 " completing request",
-		 *pgref, *this, this_instance_id);
-	complete_request(*pgref);
+        DEBUGDPP("{}.{}: with_pg_process_interruptible complete,"
+          " completing request",
+          *pgref, *this, this_instance_id);
+        complete_request(*pgref);
       });
     }, [FNAME, this, this_instance_id, pgref](std::exception_ptr eptr) {
       DEBUGDPP("{}.{}: interrupted due to {}",
 	       *pgref, *this, this_instance_id, eptr);
     }, pgref, pgref->get_osdmap_epoch()).finally(
+      // 前面的 future 无论成功还是失败，这个 lambda 都要执行
       [this, FNAME, opref=std::move(opref), pgref,
        this_instance_id, instance_handle=std::move(instance_handle), &ihref]() mutable {
-	DEBUGDPP("{}.{}: exit", *pgref, *this, this_instance_id);
-	return ihref.handle.complete(
-	).finally([instance_handle=std::move(instance_handle)] {});
+        DEBUGDPP("{}.{}: exit", *pgref, *this, this_instance_id);
+        return ihref.handle.complete(
+      ).finally([instance_handle=std::move(instance_handle)] {});
     });
 }
 

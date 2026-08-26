@@ -670,17 +670,18 @@ private:
       static_assert(std::is_void_v<ValueT> ? std::is_invocable_v<ValueFuncT>
 		                           : std::is_invocable_v<ValueFuncT, ValueT>,
                     "Value Func is not invocable with future's value");
+      // 1. lambda 返回什么？
       using value_func_result_t =
         typename std::conditional_t<std::is_void_v<ValueT>,
 				    std::invoke_result<ValueFuncT>,
 				    std::invoke_result<ValueFuncT, ValueT>>::type;
       // recognize whether there can be any error coming from the Value
-      // Function.
+      // Function. 2. lambda 返回结果声明了什么错误？
       using value_func_errorator_t = get_errorator_t<value_func_result_t>;
       // mutate the Value Function's errorator to harvest errors coming
       // from the Error Visitor. Yes, it's perfectly fine to fail error
       // handling at one step and delegate even broader set of issues
-      // to next continuation.
+      // to next continuation.  3. 加上未处理的上游错误后，完整错误集合是什么？
       using return_errorator_t = make_errorator_t<
         value_func_errorator_t,
         std::decay_t<std::invoke_result_t<ErrorVisitorT, AllowedErrors>>...>;
@@ -688,7 +689,7 @@ private:
       // care about. If Visitor handled everything and the Value Func
       // doesn't return any, we'll finish with errorator<>::future
       // which is just vanilla seastar::future – that's it, next cont
-      // finally could use `.then()`!
+      // finally could use `.then()`! 4. 最终需要构造什么样的 future？
       using futurator_t = \
         typename return_errorator_t::template futurize<value_func_result_t>;
       // `seastar::futurize`, used internally by `then_wrapped()`, would
@@ -821,6 +822,7 @@ private:
       );
     }
 
+    // 普通 seastar::future::then() 不理解 errorator 声明的错误集合
     template <class Func>
     void then(Func&&) = delete;
 
@@ -834,6 +836,7 @@ private:
         std::decay_t<std::invoke_result_t<ErrorVisitorT, AllowedErrors>>...>;
       using futurator_t = \
         typename return_errorator_t::template futurize<::seastar::future<ValueT>>;
+      //  不论上游成功还是失败，都把整个 future 交给回调检查
       return this->then_wrapped(
         [ errfunc = std::forward<ErrorVisitorT>(errfunc)
         ] (auto&& future) mutable noexcept {
