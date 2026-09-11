@@ -1235,6 +1235,7 @@ PG::run_executer_fut PG::run_executer(
     rollbacker.rollback_obc_if_modified();
   });
 
+  // 做op
   for (auto &op: ops) {
     DEBUGDPP("object {} handle op {}", *this, ox.get_target(), op);
     co_await ox.execute_op(op);
@@ -1282,6 +1283,7 @@ PG::submit_executer_fut PG::submit_executer(
   // atomically to ensure log ordering
   co_await interruptor::make_interruptible(submit_lock.lock());
 
+  // 把 OpsExecuter 前面准备的内容整理并提交
   auto [submitted, completed] = co_await std::move(
     ox
   ).flush_changes_and_submit(

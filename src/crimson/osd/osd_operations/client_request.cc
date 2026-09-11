@@ -150,15 +150,17 @@ ClientRequest::interruptible_future<> ClientRequest::with_pg_process_interruptib
   // enter_stage.
   ihref.enter_stage_sync(client_pp(pg).wait_pg_ready, *this);
 
+  // 是否应该丢弃
   if (pg.can_discard_op(*m)) {
     co_await interruptor::make_interruptible(
       shard_services->send_incremental_map(
-	std::ref(get_foreign_connection()), m->get_map_epoch()
+	      std::ref(get_foreign_connection()), m->get_map_epoch()
       ));
     DEBUGDPP("{}: discarding {}", *pgref, *this, this_instance_id);
     co_return;
   }
 
+  // 等待map符合最低要求
   auto map_epoch = co_await interruptor::make_interruptible(
     ihref.enter_blocker(
       *this, pg.osdmap_gate, &decltype(pg.osdmap_gate)::wait_for_map,
@@ -229,6 +231,7 @@ ClientRequest::interruptible_future<> ClientRequest::with_pg_process_interruptib
   DEBUGDPP("{}.{}: pg active, entering process[_pg]_op",
 	   *pgref, *this, this_instance_id);
 
+     // 普通rados的读写 process_op
   co_await (is_pg_op() ? process_pg_op(pgref) :
 	    process_op(ihref, pgref, this_instance_id));
 
@@ -244,10 +247,13 @@ seastar::future<> ClientRequest::with_pg_process(
   ceph_assert_always(shard_services);
   LOG_PREFIX(ClientRequest::with_pg_process);
 
+  // PG 当前 interval 是从哪个 epoch 开始的
   epoch_t same_interval_since = pgref->get_interval_start_epoch();
   DEBUGDPP("{}: same_interval_since: {}", *pgref, *this, same_interval_since);
+  // 当前这次的处理编号
   const auto this_instance_id = instance_id++;
   OperationRef opref{this};
+  // 请求可能重新排队，所以不能复用旧的
   auto instance_handle = get_instance_handle();
   auto &ihref = *instance_handle;
   return interruptor::with_interruption(
@@ -269,7 +275,7 @@ seastar::future<> ClientRequest::with_pg_process(
        this_instance_id, instance_handle=std::move(instance_handle), &ihref]() mutable {
         DEBUGDPP("{}.{}: exit", *pgref, *this, this_instance_id);
         return ihref.handle.complete(
-      ).finally([instance_handle=std::move(instance_handle)] {});
+                ).finally([instance_handle=std::move(instance_handle)] {});
     });
 }
 
@@ -277,13 +283,15 @@ seastar::future<> ClientRequest::with_pg(
   ShardServices &_shard_services, Ref<PG> pgref)
 {
   shard_services = &_shard_services;
+  // 用于跟踪和管理pg上的客户端请求
   pgref->client_request_orderer.add_request(*this);
 
   if (m->finish_decode()) {
     m->clear_payload();
   }
 
-  auto ret = on_complete.get_future();
+  auto ret = on_complete.get_future(); // with_pg_process调用完，会on_complete.set_value
+  // 启动with_pg_process，并忽略结果
   std::ignore = with_pg_process(std::move(pgref));
   return ret;
 }
@@ -344,18 +352,22 @@ ClientRequest::process_op(
   instance_handle_t &ihref, Ref<PG> pg, unsigned this_instance_id)
 {
   LOG_PREFIX(ClientRequest::process_op);
+  // obc_orderer: 管理同一个对象上多个并发请求执行顺序的排队器
   ihref.obc_orderer = pg->obc_loader.get_obc_orderer(m->get_hobj());
   auto obc_manager = pg->obc_loader.get_obc_manager(
     *(ihref.obc_orderer),
     m->get_hobj());
+  // 把当前请求放进这个对象的处理队列，并异步等待轮到它进入 process 阶段。
   co_await ihref.enter_stage<interruptor>(
     ihref.obc_orderer->obc_pp().process, *this);
 
   if (!pg->is_primary()) {
+    // replica read 不做 missing recovery
     DEBUGDPP(
       "Skipping recover_missings on non primary pg for soid {}",
       *pg, m->get_hobj());
   } else {
+    // 判断对象是否需要恢复
     auto unfound = co_await pg->do_recover_missing(
       m->get_hobj().get_head(), m->get_reqid());
     if (unfound) {
@@ -372,9 +384,11 @@ ClientRequest::process_op(
 
   DEBUGDPP("{}.{}: checking already_complete",
 	   *pg, *this, this_instance_id);
+  // 有重复请求，并且执行了
   auto completed = co_await pg->already_complete(m->get_reqid());
 
   if (completed) {
+    // 幂等回复
     DEBUGDPP("{}.{}: already completed, sending reply",
 	     *pg, *this, this_instance_id);
     auto reply = crimson::make_message<MOSDOpReply>(
@@ -390,6 +404,7 @@ ClientRequest::process_op(
 
   DEBUGDPP("{}.{}: not completed, about to wait_scrub",
 	   *pg, *this, this_instance_id);
+  // 等待scrub
   co_await ihref.enter_blocker(
     *this, pg->scrubber, &decltype(pg->scrubber)::wait_scrub,
     m->get_hobj());
@@ -397,6 +412,8 @@ ClientRequest::process_op(
   DEBUGDPP("{}.{}: past scrub blocker, getting obc",
 	   *pg, *this, this_instance_id);
 
+  // 加载目标对象的 ObjectContext
+  // 按照请求类型取得相应的对象锁
   int load_err = co_await pg->obc_loader.load_and_lock(
     obc_manager, pg->get_lock_type(op_info)
   ).si_then([]() -> int {
@@ -404,7 +421,7 @@ ClientRequest::process_op(
   }).handle_error_interruptible(
     PG::load_obc_ertr::all_same_way(
       [](const auto &code) -> int {
-	return -code.value();
+	      return -code.value();
       })
   );
   if (load_err) {
@@ -481,6 +498,7 @@ ClientRequest::do_process(
     co_return;
   }
 
+  // 获取快照 
   SnapContext snapc = get_snapc(*pg,obc);
 
   if ((m->has_flag(CEPH_OSD_FLAG_ORDERSNAP)) &&
@@ -494,6 +512,7 @@ ClientRequest::do_process(
     co_return;
   }
 
+  // 本次对象请求的执行上下文，持有 PG、OBC、请求属性、MOSDOp 和快照信息
   OpsExecuter ox(pg, obc, op_info, *m, get_remote_connection(), snapc);
   auto ret = co_await pg->run_executer(
     ox, obc, op_info, m->ops
@@ -527,19 +546,26 @@ ClientRequest::do_process(
     if (ret) {
       assert(should_log_error(*ret));
       if (op_info.may_write()) {
-	auto rep_tid = pg->shard_services.get_tid();
-	auto version = co_await pg->submit_error_log(
-	  m, op_info, obc, *ret, rep_tid);
+      auto rep_tid = pg->shard_services.get_tid();
+      auto version = co_await pg->submit_error_log(
+        m, op_info, obc, *ret, rep_tid);
 
-	all_completed = pg->complete_error_log(
-	  rep_tid, version);
+      all_completed = pg->complete_error_log(
+        rep_tid, version);
       }
       // simply return the error below, leaving all_completed alone
     } else {
       auto submitted = interruptor::now();
+      // OpsExecuter 内部已经持有本次写构造的事务、修改状态和相关执行上下文；
+      // 接下来由 submit_executer() 接管它并提交，当前函数不再使用原来的 ox。
       inb = ox.get_bytes_written();
+      // submitted
+      //   本次事务已经完成本地提交所要求的阶段
+
+      // all_completed
+      //   整个复制写操作全部完成
       std::tie(submitted, all_completed) = co_await pg->submit_executer(
-	std::move(ox), m->ops);
+    std::move(ox), m->ops);
       co_await std::move(submitted);
     }
     co_await ihref.enter_stage<interruptor>(

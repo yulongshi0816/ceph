@@ -497,14 +497,19 @@ seastar::future<> OSD::start()
     clog->info() << "for optimal performance please set crimson_cpu_set";
   }
 
+  // OSD::start() 本身只在 shard 0 执行。
   ceph_assert(seastar::this_shard_id() == PRIMARY_CORE);
   DEBUG("starting store");
+  // 必须先启动Store，因为PG映射和ShardSevices需要知道，osd有几个shard，store有几个storage shard，pg整么映射
   uint32_t store_shards_num = co_await store.start();
+  // 建立pg shard mapping
   co_await pg_to_shard_mappings.start(0, seastar::this_smp_shard_count(), store_shards_num);
+  // 保存的是进程级、唯一的状态或服务引用 只需要一份就够了
   co_await osd_singleton_state.start_single(
         whoami, std::ref(*cluster_msgr), std::ref(*public_msgr),
         std::ref(*monc), std::ref(*mgrc));
   co_await osd_states.start();
+  // 会在每个shard上创建一份ShardSevices，每个cpu核上处理pg和osd所需要的一组本地服务
   co_await shard_services.start(
         std::ref(osd_singleton_state),
         std::ref(pg_to_shard_mappings),
@@ -517,7 +522,7 @@ seastar::future<> OSD::start()
   heartbeat = std::make_unique<Heartbeat>(
     whoami, get_shard_services(),
     *monc, *hb_front_msgr, *hb_back_msgr);
-  DEBUG("mounting store");
+  DEBUG("mounting store"); // 挂store
   co_await store.mount().handle_error(
       crimson::stateful_ec::assert_failure(fmt::format(
         "{} error mounting object store in {}",
@@ -920,6 +925,7 @@ OSD::ms_dispatch(crimson::net::ConnectionRef conn, MessageRef m)
     return std::nullopt;
   }
 
+  // maybe_ret可能返回一个很长的future，比如等待osdmap，检查pg owner shard
   gate.dispatch_in_background(
       __func__, *this, [ret=std::move(maybe_ret.value())]() mutable {
     return std::move(ret);

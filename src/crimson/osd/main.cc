@@ -143,7 +143,7 @@ int main(int argc, const char* argv[])
 
           DEBUG("starting sharded config service");
           sharded_conf().start(
-	    early_config.init_params.name, early_config.cluster_name).get();
+	        early_config.init_params.name, early_config.cluster_name).get();
           local_conf().start().get();
           auto stop_conf = seastar::deferred_stop(sharded_conf());
 
@@ -243,7 +243,7 @@ int main(int argc, const char* argv[])
           crimson::osd::OSD osd(
             whoami, nonce, std::ref(should_stop.abort_source()),
             std::ref(*store), cluster_msgr, client_msgr,
-	    hb_front_msgr, hb_back_msgr);
+	            hb_front_msgr, hb_back_msgr);
 
           if (config.count("mkkey")) {
             DEBUG("generating keyring");
@@ -274,8 +274,8 @@ int main(int argc, const char* argv[])
               seastar::sync_directory(root).get();
             }
             osd.mkfs(
-	      *store,
-	      whoami,
+            *store,
+              whoami,
               osd_uuid,
               local_conf().get_val<uuid_d>("fsid"),
               config["osdspec-affinity"].as<std::string>()).get();
@@ -285,13 +285,13 @@ int main(int argc, const char* argv[])
             return EXIT_SUCCESS;
           } else {
             DEBUG("starting OSD services");
-            osd.start().get();
+            osd.start().get(); // 启动osd
           }
           INFO("crimson startup completed");
 
           should_stop.wait().get();
           INFO("crimson shutting down");
-          osd.stop().get();
+          osd.stop().get(); // 停止osd
         } catch (...) {
           logger().error("startup failed: {}", std::current_exception());
           return EXIT_FAILURE;

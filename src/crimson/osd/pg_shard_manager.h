@@ -186,8 +186,9 @@ public:
       core_id_t core,
       typename T::IRef &&op,
       F &&f) {
+    // 当前op只能有一个持有者
     ceph_assert(op->use_count() == 1);
-    if (seastar::this_shard_id() == core) {
+    if (seastar::this_shard_id() == core) { // pg在当前shard
       auto f_conn = op->prepare_remote_submission();
       op->finish_remote_submission(std::move(f_conn));
       auto &target_shard_services = shard_services.local();
@@ -207,6 +208,7 @@ public:
     return opref.get_handle().complete(
     ).then([this, core, cc_seq,
             op=std::move(op), f=std::move(f)]() mutable {
+     // 从源registry移除
       get_local_state().registry.remove_from_registry(*op);
       auto f_conn = op->prepare_remote_submission();
       return shard_services.invoke_on(
@@ -215,6 +217,7 @@ public:
          f=std::move(f), op=std::move(op), f_conn=std::move(f_conn)
         ](auto &target_shard_services) mutable {
         op->finish_remote_submission(std::move(f_conn));
+        // 加入目标registry
         target_shard_services.local_state.registry.add_to_registry(*op);
         return this->template process_ordered_op_remotely<T>(
             cc_seq, target_shard_services, std::move(op), std::move(f));
@@ -253,6 +256,7 @@ public:
   }
 
   /// Runs opref on the appropriate core, waiting for pg as necessary
+  // operation 已经到达正确的 owner shard，现在查找真正的 PG 对象；找到了就处理请求，没找到则决定等待还是丢弃。
   template <typename T>
   seastar::future<> run_with_pg_maybe_wait(
     typename T::IRef op,
@@ -261,40 +265,46 @@ public:
     static_assert(!T::can_create());
     auto &logger = crimson::get_logger(ceph_subsys_osd);
     auto &opref = *op;
+   // 如果后面因为 PG 尚未创建而等待，就记录当前 operation 正在被“PG 创建”阻塞。
     return opref.template with_blocking_event<
       PGMap::PGCreationBlockingEvent
-    >([&target_shard_services, &opref, &logger](auto &&trigger) mutable {
+        >([&target_shard_services, &opref, &logger](auto &&trigger) mutable {
+      // 在owner shard中查PG实例
       auto pg = target_shard_services.get_pg(opref.get_pgid());
       auto fut = ShardServices::wait_for_pg_ertr::make_ready_future<Ref<PG>>(pg);
       if (!pg) {
-	if (opref.requires_pg()) {
-	  auto osdmap = target_shard_services.get_map();
-	  if (!osdmap->is_up_acting_osd_shard(
-		opref.get_pgid(), target_shard_services.local_state.whoami)) {
-	    logger.debug(
-	      "pg {} for {} is no longer here, discarding",
-	      opref.get_pgid(), opref);
-	    opref.get_handle().exit();
-	    auto _fut = seastar::now();
-	    if (osdmap->get_epoch() > opref.get_epoch_sent_at()) {
-	      _fut = target_shard_services.send_incremental_map(
-		std::ref(opref.get_foreign_connection()),
-		opref.get_epoch_sent_at() + 1);
-	    }
-	    return _fut;
-	  }
-	}
-	fut = target_shard_services.wait_for_pg(
-	  std::move(trigger), opref.get_pgid());
+        if (opref.requires_pg()) {
+          // 目标 shard 当前使用的最新 OSDMap
+          auto osdmap = target_shard_services.get_map();
+          if (!osdmap->is_up_acting_osd_shard( // 当前osd是否属于这个PG的up/acting集合
+            opref.get_pgid(), target_shard_services.local_state.whoami)) {
+              logger.debug(
+                "pg {} for {} is no longer here, discarding", // 丢弃请求
+                opref.get_pgid(), opref);
+              opref.get_handle().exit();
+              auto _fut = seastar::now();
+              if (osdmap->get_epoch() > opref.get_epoch_sent_at()) {
+                _fut = target_shard_services.send_incremental_map(
+                  std::ref(opref.get_foreign_connection()),
+                  opref.get_epoch_sent_at() + 1);
+                }
+            return _fut;
+	        }
+	      }
+        // 等待pg
+        fut = target_shard_services.wait_for_pg(
+        std::move(trigger), opref.get_pgid());
       }
+
       return fut.safe_then([&logger, &target_shard_services, &opref](Ref<PG> pgref) {
-	logger.debug("{}: have_pg", opref);
-	return opref.with_pg(target_shard_services, pgref);
-      }).handle_error(
-	crimson::ct_error::ecanceled::handle([&logger, &opref](auto) {
-	  logger.debug("{}: pg creation canceled, dropping", opref);
-	  return seastar::now();
-	})
+        logger.debug("{}: have_pg", opref);
+        // pg存在，直接去处理
+        return opref.with_pg(target_shard_services, pgref);
+            }).handle_error(
+        crimson::ct_error::ecanceled::handle([&logger, &opref](auto) {
+          logger.debug("{}: pg creation canceled, dropping", opref);
+          return seastar::now();
+	      })
       );
     }).then([op=std::move(op)] {});
   }
@@ -368,6 +378,7 @@ public:
       });
   }
 
+  // 创建一个 PG operation，等待 OSD 和 OSDMap 准备好，找到 PG 所属的 shard，然后把 operation 送到对应 shard 处理。
   template <typename T, typename... Args>
   auto start_pg_operation(Args&&... args) {
     auto op = get_local_state().registry.create_operation<T>(
@@ -377,37 +388,41 @@ public:
 
     auto &opref = *op;
     auto id = op->get_id();
-    if constexpr (T::is_trackable) {
+    if constexpr (T::is_trackable) { // 记录一个startEvent
       op->template track_event<typename T::StartEvent>();
     }
     auto fut = opref.template enter_stage<>(
+      // 请求进入当前连接的 await_active 阶段。
       opref.get_connection_pipeline().await_active
     ).then([this, &opref, &logger] {
       logger.debug("{}: start_pg_operation in await_active stage", opref);
+      // 等待osdState变成active,防止osd还没启动或者正在重启，正在加载osdmap
       return get_shard_services().local_state.osd_state.when_active();
     }).then([&logger, &opref] {
       logger.debug("{}: start_pg_operation active, entering await_map", opref);
       return opref.template enter_stage<>(
-	opref.get_connection_pipeline().await_map);
+      	opref.get_connection_pipeline().await_map);
     }).then([this, &logger, &opref] {
       logger.debug("{}: start_pg_operation await_map stage", opref);
       using OSDMapBlockingEvent =
-	OSD_OSDMapGate::OSDMapBlocker::BlockingEvent;
-      return opref.template with_blocking_event<OSDMapBlockingEvent>(
-	[this, &opref](auto &&trigger) {
-	  std::ignore = this;
-	  return get_shard_services().local_state.osdmap_gate.wait_for_map(
-	      std::move(trigger),
-	      opref.get_epoch(),
-	      &get_shard_services());
-      });
+        OSD_OSDMapGate::OSDMapBlocker::BlockingEvent;
+            return opref.template with_blocking_event<OSDMapBlockingEvent>(
+        [this, &opref](auto &&trigger) {
+          std::ignore = this;
+      // 真正等待osdmap，处理epoch，保证epoch最新
+      return get_shard_services().local_state.osdmap_gate.wait_for_map(
+          std::move(trigger),
+          opref.get_epoch(),
+          &get_shard_services());
+        });
     }).then([&logger, &opref](auto epoch) {
       logger.debug("{}: got map {}, entering get_pg_mapping", opref, epoch);
       return opref.template enter_stage<>(
-	opref.get_connection_pipeline().get_pg_mapping);
+	      opref.get_connection_pipeline().get_pg_mapping);
     }).then([this, &opref] {
+      // 根据 pgid 查找 PG 的 owner shard
       return get_pg_to_shard_mapping().get_or_create_pg_mapping(opref.get_pgid());
-    }).then_wrapped([this, &logger, op=std::move(op)](auto fut) mutable {
+    }).then_wrapped([this, &logger, op=std::move(op)](auto fut) mutable { //then_wrapped 它无论前面成功还是失败都会执行
       if (unlikely(fut.failed())) {
         logger.error("{}: failed before with_pg", *op);
         op->get_handle().exit();
@@ -419,26 +434,30 @@ public:
                    *op, T::can_create(), core_store.first);
       return this->template with_remote_shard_state_and_op<T>(
         core_store.first, std::move(op),
+        // operation 到达 PG 的 owner shard 后，先进入 create_or_wait_pg
+        //  排队阶段，然后根据 operation 类型决定“可以创建 PG”还是“只能等待 PG”。
+        // 外层lamba
         [this, core_store](ShardServices &target_shard_services,
                typename T::IRef op) {
-        auto &opref = *op;
-        auto &logger = crimson::get_logger(ceph_subsys_osd);
-        logger.debug("{}: entering create_or_wait_pg", opref);
-        return opref.template enter_stage<>(
-          opref.get_pershard_pipeline(target_shard_services).create_or_wait_pg
-        ).then([this, &target_shard_services, op=std::move(op), core_store]() mutable {
-          if constexpr (T::can_create()) {
-            return this->template run_with_pg_maybe_create<T>(
-                std::move(op), target_shard_services, core_store.second);
-          } else {
-            (void)core_store; // silence unused capture warning
-            return this->template run_with_pg_maybe_wait<T>(
-                std::move(op), target_shard_services);
-          }
+          auto &opref = *op;
+          auto &logger = crimson::get_logger(ceph_subsys_osd);
+          logger.debug("{}: entering create_or_wait_pg", opref);
+          return opref.template enter_stage<>(
+            opref.get_pershard_pipeline(target_shard_services).create_or_wait_pg
+            ).then([this, &target_shard_services, op=std::move(op), core_store]() mutable {
+              // 内层
+              if constexpr (T::can_create()) { // 判断这种 operation 是否有资格创建不存在的 PG。
+                return this->template run_with_pg_maybe_create<T>(
+                    std::move(op), target_shard_services, core_store.second);
+              } else {
+                (void)core_store; // silence unused capture warning
+                return this->template run_with_pg_maybe_wait<T>(
+                    std::move(op), target_shard_services);
+              }
         });
       });
     });
-    return std::make_pair(id, std::move(fut));
+    return std::make_pair(id, std::move(fut)); // first operation id, second 整个请求处理过程的future
   }
 
   template <typename T, typename... Args>

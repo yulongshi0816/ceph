@@ -875,6 +875,7 @@ OpsExecuter::flush_changes_and_submit(
   SnapMapper& snap_mapper,
   OSDriver& osdriver)
 {
+  // 是否产生了对象的修改
   const bool want_mutate = !txn.empty();
   // osd_op_params are instantiated by every wr-like operation.
   assert(osd_op_params || !want_mutate);
@@ -889,6 +890,7 @@ OpsExecuter::flush_changes_and_submit(
 
   apply_stats();
   if (want_mutate) {
+    // pg日志的版本
     osd_op_params->at_version = pg->get_next_version();
     osd_op_params->pg_trim_to = pg->get_pg_trim_to();
     osd_op_params->pg_committed_to = pg->get_pg_committed_to();
@@ -900,6 +902,7 @@ OpsExecuter::flush_changes_and_submit(
       log_entries.emplace_back(complete_cloning_ctx());
     }
 
+    // 把本次写对应的关键信息记录进 pg_log_entry_t
     log_entries.emplace_back(prepare_head_update(ops, txn));
 
     if (auto log_rit = log_entries.rbegin(); log_rit != log_entries.rend()) {

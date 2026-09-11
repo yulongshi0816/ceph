@@ -1180,6 +1180,7 @@ public:
     return peering_state.get_peer_missing();
   }
   epoch_t get_interval_start_epoch() const {
+    // 从哪个 OSDMap epoch 开始，这个 PG 一直处于当前 interval，期间没有发生会导致新 interval 的关键映射变化。
     return get_info().history.same_interval_since;
   }
   const pg_missing_const_i* maybe_get_shard_missing(pg_shard_t shard) const {

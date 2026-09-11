@@ -57,6 +57,7 @@ seastar::future<> PGShardMapping::dump_store_shards(Formatter *f) const {
   return seastar::now();
 }
 
+// 返回PG所属的CPU的shared，和pg所用的store的shard  index
 seastar::future<std::pair<core_id_t, store_index_t>> PGShardMapping::get_or_create_pg_mapping(
   spg_t pgid,
   core_id_t core_expected,
@@ -76,6 +77,7 @@ seastar::future<std::pair<core_id_t, store_index_t>> PGShardMapping::get_or_crea
   } else {
     DEBUG("calling primary to add mapping for pg {} to the expected core {}",
           pgid, core_expected);
+    // 把“查询或创建映射”的工作发送到 shard 0。
     return container().invoke_on(
         0, [pgid, core_expected, store_index, FNAME, this](auto &primary_mapping) {
       auto core_to_update = core_expected;
@@ -107,12 +109,14 @@ seastar::future<std::pair<core_id_t, store_index_t>> PGShardMapping::get_or_crea
       } else { // find_iter == primary_mapping.pg_to_core.end()
         // this pgid isn't mapped within primary_mapping,
         // add the mapping and ajust core_to_num_pgs
+        // core_to_num_pgs cpu shard id -> 当前分配了多少PG
         ceph_assert_always(primary_mapping.core_to_num_pgs.size() > 0);
         std::map<core_id_t, unsigned>::iterator count_iter;
         std::map<core_id_t, std::map<unsigned, unsigned>>::iterator core_shard_iter;
         std::map<unsigned, unsigned>::iterator shard_iter;
-        if (core_expected == NULL_CORE) {
+        if (core_expected == NULL_CORE) { // 未指定core
           assert(store_index == NULL_STORE_INDEX);
+          // 当前 PG 数量最少的 core。
           count_iter = std::min_element(
             primary_mapping.core_to_num_pgs.begin(),
             primary_mapping.core_to_num_pgs.end(),
@@ -125,12 +129,16 @@ seastar::future<std::pair<core_id_t, store_index_t>> PGShardMapping::get_or_crea
           count_iter = primary_mapping.core_to_num_pgs.find(core_to_update);
         }
         ceph_assert_always(primary_mapping.core_to_num_pgs.end() != count_iter);
-        ++(count_iter->second);
+        ++(count_iter->second); // 更新core对应的pg数
 
         if(crimson::common::get_conf<bool>("seastore_require_partition_count_match_reactor_count")) {
-          shard_index_update = 0;
+          shard_index_update = 0; // cpu的shard等于seastore的shard场景下
         } else {
           if (seastar::this_smp_shard_count() > store_shard_nums ) {
+            // Store shard 0 ← CPU shard 0、4
+            // Store shard 1 ← CPU shard 1、5
+            // Store shard 2 ← CPU shard 2、6
+            // Store shard 3 ← CPU shard 3、7
             auto alien_iter = primary_mapping.core_alien_to_num_pgs.find(core_to_update);
             auto core_iter = std::min_element(
               alien_iter->second.begin(),
@@ -145,6 +153,13 @@ seastar::future<std::pair<core_id_t, store_index_t>> PGShardMapping::get_or_crea
           if (seastar::this_smp_shard_count() >= store_shard_nums) {
             shard_index_update = 0; // use the first store shard index on this core
           } else {
+          //  CPU shard 0：
+          //   store_index 0
+          //   store_index 1
+
+          // CPU shard 1：
+          //   store_index 0
+          //   store_index 1
             core_shard_iter = primary_mapping.core_shard_to_num_pgs.find(core_to_update);
             ceph_assert_always(core_shard_iter != primary_mapping.core_shard_to_num_pgs.end());
             if (shard_index_update == NULL_STORE_INDEX) {
@@ -164,6 +179,7 @@ seastar::future<std::pair<core_id_t, store_index_t>> PGShardMapping::get_or_crea
             ++(shard_iter->second);
           }
         }
+        // 最终结果写入 shard 0 的权威映射表：
         [[maybe_unused]] auto [insert_iter, inserted] =
           primary_mapping.pg_to_core.emplace(pgid, std::make_pair(core_to_update, shard_index_update));
         assert(inserted);
@@ -171,9 +187,11 @@ seastar::future<std::pair<core_id_t, store_index_t>> PGShardMapping::get_or_crea
               pgid, core_to_update, count_iter->second, shard_index_update);
       }
       assert(core_to_update != NULL_CORE);
+      // 在 shard 0 以外的所有 shard 上执行这个 lambda。
       return primary_mapping.container().invoke_on_others(
           [pgid, core_to_update, shard_index_update, FNAME](auto &other_mapping) {
         auto find_iter = other_mapping.pg_to_core.find(pgid);
+        // shard上没有
         if (find_iter == other_mapping.pg_to_core.end()) {
           DEBUG("mapping pg {} to core {} (others), store_index {}",
                 pgid, core_to_update, shard_index_update);
@@ -181,6 +199,7 @@ seastar::future<std::pair<core_id_t, store_index_t>> PGShardMapping::get_or_crea
             other_mapping.pg_to_core.emplace(pgid, std::make_pair(core_to_update, shard_index_update));
           assert(inserted);
         } else {
+          // shard有
           auto core_found = find_iter->second.first;
           auto store_index_found = find_iter->second.second;
           if (core_found != core_to_update ||store_index_found != shard_index_update) {
@@ -193,6 +212,7 @@ seastar::future<std::pair<core_id_t, store_index_t>> PGShardMapping::get_or_crea
         }
       });
     }).then([this, pgid, core_expected, store_index, FNAME] {
+      // 上面创建完了，返回
       auto find_iter = pg_to_core.find(pgid);
       if (find_iter == pg_to_core.end()) {
         ERROR("the mapping is inconsistent for pg {}: core not found, expected {}",
@@ -274,10 +294,12 @@ PGMap::wait_for_pg_ret
 PGMap::wait_for_pg(PGCreationBlockingEvent::TriggerI&& trigger, spg_t pgid)
 {
   if (auto pg = get_pg(pgid)) {
+    // pg已存在，立即返回
     return make_pair(
       wait_for_pg_fut(wait_for_pg_ertr::ready_future_marker{}, pg),
       true);
   } else {
+    // 如果 map 中还没有这个 PG 的等待状态，就创建一个；如果已经有，就使用已有状态。
     auto &state = pgs_creating.emplace(pgid, pgid).first->second;
     return make_pair(
       wait_for_pg_fut(

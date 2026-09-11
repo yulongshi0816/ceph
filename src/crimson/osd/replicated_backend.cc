@@ -115,6 +115,7 @@ ReplicatedBackend::submit_transaction(
   cancel_pct_update();
 
   const ceph_tid_t tid = shard_services.get_tid();
+  // penging_trans记录仍在进行复制事务，这里3副本的话，这个pg_shards.size（）=3，戴白偶需要等待3个都完成
   auto pending_txn =
     pending_trans.try_emplace(
       tid,
@@ -122,6 +123,7 @@ ReplicatedBackend::submit_transaction(
       osd_op_p.at_version,
       pg.get_last_complete()).first;
   bufferlist encoded_txn_p_bl, encoded_txn_d_bl;
+  // encoded_txn_p_bl事务描述部分 encoded_txn_d_bl 事务写入数据部分
   txn.encode(encoded_txn_p_bl, encoded_txn_d_bl, pg.min_peer_features());
 
   bool is_delete = false;
@@ -143,33 +145,38 @@ ReplicatedBackend::submit_transaction(
     }
     MURef<MOSDRepOp> m;
     if (pg.should_send_op(pg_shard, hoid)) {
+      // 非recover，peering这些异常状态的正常发送
       m = new_repop_msg(
-	pg_shard, hoid, encoded_txn_p_bl, encoded_txn_d_bl, osd_op_p,
-	min_epoch, map_epoch, log_entries, true, tid);
+        pg_shard, hoid, encoded_txn_p_bl, encoded_txn_d_bl, osd_op_p,
+        min_epoch, map_epoch, log_entries, true, tid);
     } else {
+      // 只发送必要的日志信息，可能通过revocre这些恢复
       m = new_repop_msg(
-	pg_shard, hoid, encoded_txn_p_bl, encoded_txn_d_bl, osd_op_p,
-	min_epoch, map_epoch, log_entries, false, tid);
+        pg_shard, hoid, encoded_txn_p_bl, encoded_txn_d_bl, osd_op_p,
+        min_epoch, map_epoch, log_entries, false, tid);
       if (pg.is_missing_on_peer(pg_shard, hoid)) {
-	if (_new_clone) {
-	  // The head is in the push queue but hasn't been pushed yet.
-	  // We need to ensure that the newly created clone will be
-	  // pushed as well, otherwise we might skip it.
-	  // See: https://tracker.ceph.com/issues/68808
-	  to_push_clone.push_back(pg_shard);
-	}
-	if (is_delete) {
-	  to_push_delete.push_back(pg_shard);
-	}
+        if (_new_clone) {
+          // The head is in the push queue but hasn't been pushed yet.
+          // We need to ensure that the newly created clone will be
+          // pushed as well, otherwise we might skip it.
+          // See: https://tracker.ceph.com/issues/68808
+          to_push_clone.push_back(pg_shard);
+        }
+        if (is_delete) {
+          to_push_delete.push_back(pg_shard);
+        }
       }
     }
+    // 记录需要等待的副本
     pending_txn->second.acked_peers.push_back({pg_shard, eversion_t{}});
     // TODO: set more stuff. e.g., pg_states
+    // 只把发送产生的 future 放进 sends,此时并没有等待osd的写入
     sends->emplace_back(
       shard_services.send_to_osd(
-	pg_shard.osd, std::move(m), map_epoch));
+	      pg_shard.osd, std::move(m), map_epoch));
   }
 
+  // PG log的修改加入本地事务
   pg.log_operation(
     std::move(log_entries),
     std::nullopt,
@@ -180,6 +187,7 @@ ReplicatedBackend::submit_transaction(
     txn,
     false);
 
+    // 将事务提交给当前 primary 的本地 store：
   auto all_completed = interruptor::make_interruptible(
     crimson::os::with_store_do_transaction(
       shard_services.get_store(pg.get_store_index()),
@@ -200,6 +208,13 @@ ReplicatedBackend::submit_transaction(
       return seastar::now();
     }
     // wait for all peers to ack (ReplicatedBackend::got_rep_op_reply)
+    // primary 本地事务已完成
+    // pending = 2
+    //         ↓
+    // 等待 all_committed shared_future
+    //         ↓
+    // 当前 ClientRequest 协程不占用 CPU
+    // 之后 replica 的回复由另外的消息处理路径接收：
     return peers->all_committed.get_shared_future();
   }).then_interruptible([pending_txn, this, _new_clone, &hoid,
 			to_push_delete=std::move(to_push_delete),
@@ -219,6 +234,7 @@ ReplicatedBackend::submit_transaction(
     return seastar::now();
   });
 
+  //  等所有复制消息发出
   auto sends_complete = seastar::when_all_succeed(
     sends->begin(), sends->end()
   ).finally([sends=std::move(sends)] {});

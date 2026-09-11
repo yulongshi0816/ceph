@@ -654,10 +654,10 @@ PGBackend::interruptible_future<> PGBackend::set_allochint(
 }
 
 PGBackend::write_iertr::future<> PGBackend::write(
-    ObjectState& os,
-    const OSDOp& osd_op,
-    ceph::os::Transaction& txn,
-    osd_op_params_t& osd_op_params,
+    ObjectState& os, // 当前对象的内存状态
+    const OSDOp& osd_op, // 当前正在执行的WRITE操作
+    ceph::os::Transaction& txn, // 事务
+    osd_op_params_t& osd_op_params, // 整个写请求的共享参数
     object_stat_sum_t& delta_stats)
 {
   const ceph_osd_op& op = osd_op.op;
@@ -672,19 +672,20 @@ PGBackend::write_iertr::future<> PGBackend::write(
     return crimson::ct_error::file_too_large::make();
   }
 
+  // 处理 write 和 truncate 请求乱序到达的问题。
   if (auto seq = os.oi.truncate_seq;
       seq != 0 && op.extent.truncate_seq < seq) {
     // old write, arrived after trimtrunc
     if (offset + length > os.oi.size) {
       // no-op
       if (offset > os.oi.size) {
-	length = 0;
-	buf.clear();
+        length = 0;
+        buf.clear();
       } else {
-	// truncate
-	auto len = os.oi.size - offset;
-	buf.splice(len, length);
-	length = len;
+        // truncate
+        auto len = os.oi.size - offset;
+        buf.splice(len, length);
+        length = len;
       }
     }
   } else if (op.extent.truncate_seq > seq) {
@@ -709,6 +710,7 @@ PGBackend::write_iertr::future<> PGBackend::write(
     os.oi.truncate_seq = op.extent.truncate_seq;
     os.oi.truncate_size = op.extent.truncate_size;
   }
+
   maybe_create_new_object(os, txn, delta_stats);
   if (length == 0) {
     if (offset > os.oi.size) {
@@ -718,6 +720,7 @@ PGBackend::write_iertr::future<> PGBackend::write(
       txn.nop();
     }
   } else {
+    // 构造事务，更新内存
     txn.write(coll->get_cid(), ghobject_t{os.oi.soid},
 	      offset, length, std::move(buf), op.flags);
     update_size_and_usage(delta_stats, osd_op_params.modified_ranges,
