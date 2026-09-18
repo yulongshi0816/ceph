@@ -805,6 +805,7 @@ TransactionManager::do_submit_transaction(
   );
 
   SUBTRACET(seastore_t, "write delayed ool extents", tref);
+  // OOL OUT of Line
   auto ool_start = std::chrono::steady_clock::now();
   co_await epm->write_delayed_ool_extents(
     tref, dispatch_result.alloc_map
@@ -827,12 +828,15 @@ TransactionManager::do_submit_transaction(
   // In the future, when no_conflict transactions may also modify
   // logical extents, we should add something like "lock_logical_mutated_extents"
   // and invoke it before writing ool extents.
+  //   在即将提交这些修改前，
+  //   保护涉及的树节点/extent
   auto locker = co_await trans_intr::make_interruptible(
     lock_mutated_nodes(tref));
 
   auto num_extents = allocated_extents.size();
   SUBTRACET(seastore_t, "process {} allocated extents", tref, num_extents);
   ool_start = std::chrono::steady_clock::now();
+  // 等待这批OOL extent写出完成
   co_await epm->write_preallocated_ool_extents(tref, allocated_extents);
   tref.get_phase_durations().ool_write +=
     std::chrono::steady_clock::now() - ool_start;
@@ -840,8 +844,7 @@ TransactionManager::do_submit_transaction(
   SUBTRACET(seastore_t, "entering prepare", tref);
   auto prepare_enter_start = std::chrono::steady_clock::now();
   co_await trans_intr::make_interruptible(
-    tref.get_handle().enter(write_pipeline.prepare)
-  );
+    tref.get_handle().enter(write_pipeline.prepare));
 
   // For conflicting transactions, we can release the lock
   // now. Because other transactions accessing the same
@@ -876,7 +879,7 @@ TransactionManager::do_submit_transaction(
     std::move(record),
     tref.get_handle(),
     tref.get_src(),
-    [&locker, this, FNAME, &tref](record_locator_t submit_result) {
+    [&locker, this, FNAME, &tref](record_locator_t submit_result) { // 完成后回调
     SUBDEBUGT(seastore_t, "committed with {}", tref, submit_result);
     auto start_seq = submit_result.write_result.start_seq;
     journal->get_trimmer().set_journal_head(start_seq);

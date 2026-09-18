@@ -71,6 +71,7 @@ guarded_object_data_t guard_object_data(context_t ctx)
   return guarded_object_data_t{ctx, ctx.onode.get_layout().object_data.get()};
 }
 
+// 从onode取出object_data，执行具体的F操作，如果object_data被更改，那么就更新onode
 template <typename F>
 auto with_object_data(
   ObjectDataHandler::context_t ctx,
@@ -123,25 +124,26 @@ ObjectDataHandler::prepare_data_reservation(
 {
   LOG_PREFIX(ObjectDataHandler::prepare_data_reservation);
   ceph_assert(size <= max_object_size);
-  if (!object_data.is_null()) {
+  if (!object_data.is_null()) { // 对象已经分配过空间了
     ceph_assert(object_data.get_reserved_data_len() == max_object_size);
     DEBUGT("reservation present: {}~0x{:x}",
            ctx.t,
            object_data.get_reserved_data_base(),
            object_data.get_reserved_data_len());
+
     return write_iertr::make_ready_future<std::optional<LBAMapping>>();
-  } else {
-    auto hint = onode.get_data_hint();
+  } else { // 新对象
+    auto hint = onode.get_data_hint(); // 推荐位置
     DEBUGT("reserving: {}~0x{:x}",
            ctx.t, hint, max_object_size);
-    return ctx.tm.reserve_region(
+    return ctx.tm.reserve_region( // 预留空间，大小为max_object_size
       ctx.t,
       hint,
       max_object_size,
       extent_types_t::OBJECT_DATA_BLOCK
     ).si_then([max_object_size=max_object_size, &object_data](auto pin) {
       ceph_assert(pin.get_length() == max_object_size);
-      object_data.update_reserved(
+      object_data.update_reserved( // 预留成功后，吧逻辑地址的起点和长度记录到object_data
 	pin.get_key(),
 	pin.get_length());
       return std::make_optional<LBAMapping>(std::move(pin));
@@ -451,16 +453,17 @@ ObjectDataHandler::write_ret do_write(
   data_t &data)
 {
   assert(data.bl);
+  // 分配extent
   return ctx.tm.alloc_data_extents<ObjectDataBlock>(
     ctx.t,
-    laddr_hint_t::create_as_fixed(overwrite_range.aligned_begin),
+    laddr_hint_t::create_as_fixed(overwrite_range.aligned_begin), // 新数据 extent 的逻辑地址必须从 aligned_begin 开始。
     overwrite_range.aligned_end.template get_byte_distance<
       extent_len_t>(overwrite_range.aligned_begin),
     std::move(write_pos)
   ).si_then([&overwrite_range, &data](auto extents) {
     auto off = overwrite_range.aligned_begin;
     auto left = overwrite_range.aligned_end.template get_byte_distance<
-      extent_len_t>(overwrite_range.aligned_begin);
+      extent_len_t>(overwrite_range.aligned_begin); // 剩余多少字节未复制
     bufferlist _bl;
     if (data.headbl) {
       _bl.append(*data.headbl);
@@ -474,15 +477,16 @@ ObjectDataHandler::write_ret do_write(
     for (auto &extent : extents) {
       ceph_assert(left >= extent->get_length());
       if (extent->get_laddr() != off) {
-	logger().debug(
-	  "object_data_handler::do_insertions alloc got addr {},"
-	  " should have been {}",
-	  extent->get_laddr(),
-	  off);
-      }
-      iter.copy(extent->get_length(), extent->get_bptr().c_str());
-      off = (off + extent->get_length()).checked_to_laddr();
-      left -= extent->get_length();
+        logger().debug(
+          "object_data_handler::do_insertions alloc got addr {},"
+          " should have been {}",
+          extent->get_laddr(),
+          off);
+        }
+        // 数据复制
+        iter.copy(extent->get_length(), extent->get_bptr().c_str());
+        off = (off + extent->get_length()).checked_to_laddr();
+        left -= extent->get_length();
     }
     return ObjectDataHandler::write_iertr::now();
   }).handle_error_interruptible(
@@ -1028,11 +1032,12 @@ ObjectDataHandler::handle_single_mapping_overwrite(
   LBAMapping mapping,
   op_type_t op_type)
 {
+  // 当前写入完全位于一个 mapping 内时，应该用哪种方式修改这个 mapping？
   auto ehpolicy = get_edge_handle_policy(
     mapping,
     overwrite_range.aligned_begin,
     overwrite_range.aligned_len,
-    op_type);
+    op_type); // 新写的REMAP
   auto do_overwrite = [ctx, &overwrite_range, &data, op_type](auto pos) {
     if (overwrite_range.is_empty()) {
       // the overwrite is completed in the previous steps,
@@ -1042,18 +1047,18 @@ ObjectDataHandler::handle_single_mapping_overwrite(
     if (overwrite_range.aligned_end.template get_byte_distance<
 	  extent_len_t>(overwrite_range.aligned_begin) == ctx.tm.get_block_size()
 	&& (data.headbl || data.tailbl)) {
-      // the range to zero is within a block
+      // the range to zero is within a block2
       bufferlist bl;
       if (data.headbl) {
-	bl.append(*data.headbl);
+	      bl.append(*data.headbl);
       }
       if (!data.bl) {
-	bl.append_zero(overwrite_range.unaligned_len);
+	      bl.append_zero(overwrite_range.unaligned_len);
       } else {
-	bl.append(*data.bl);
+	      bl.append(*data.bl);
       }
       if (data.tailbl) {
-	bl.append(*data.tailbl);
+	      bl.append(*data.tailbl);
       }
       data.headbl.reset();
       data.tailbl.reset();
@@ -1063,9 +1068,9 @@ ObjectDataHandler::handle_single_mapping_overwrite(
       return do_write(ctx, std::move(pos), overwrite_range, data);
     } else {
       if (op_type == op_type_t::OP_CLONERANGE) {
-	return do_clonerange(ctx, std::move(pos), overwrite_range, data);
+	      return do_clonerange(ctx, std::move(pos), overwrite_range, data);
       } else {
-	return do_zero(ctx, std::move(pos), overwrite_range, data);
+	      return do_zero(ctx, std::move(pos), overwrite_range, data);
       }
     }
   };
@@ -1089,23 +1094,26 @@ ObjectDataHandler::handle_single_mapping_overwrite(
       auto fut = base_iertr::now();
       edge_t edge =  edge_t::NONE;
       if (!overwrite_range.is_begin_aligned(ctx.tm.get_block_size())) {
-	edge = static_cast<edge_t>(edge | edge_t::LEFT);
+	      edge = static_cast<edge_t>(edge | edge_t::LEFT);
       }
       if (!overwrite_range.is_end_aligned(ctx.tm.get_block_size())) {
-	edge = static_cast<edge_t>(edge | edge_t::RIGHT);
+	      edge = static_cast<edge_t>(edge | edge_t::RIGHT);
       }
       if (edge != edge_t::NONE) {
-	fut = read_unaligned_edge_data(
-	  ctx, overwrite_range, data, mapping, edge);
+        // 左或者右不对齐，等待读完
+        fut = read_unaligned_edge_data(
+          ctx, overwrite_range, data, mapping, edge);
       }
+
       return fut.si_then([ctx, &overwrite_range, mapping] {
-	return ctx.tm.punch_hole_in_mapping<ObjectDataBlock>(
-	  ctx.t, overwrite_range.aligned_begin,
-	  overwrite_range.aligned_len, std::move(mapping));
-      }).si_then([do_overwrite=std::move(do_overwrite)](auto pos) {
-	return do_overwrite(std::move(pos));
-      });
-    }
+        // 从原来的 mapping 中删除本次要重新映射的对齐范围，并保留左右没有被覆盖的部分。
+        return ctx.tm.punch_hole_in_mapping<ObjectDataBlock>(
+          ctx.t, overwrite_range.aligned_begin,
+          overwrite_range.aligned_len, std::move(mapping));
+            }).si_then([do_overwrite=std::move(do_overwrite)](auto pos) {
+              return do_overwrite(std::move(pos));
+            });
+     }
   default:
     ceph_abort_msg("unexpected edge handling policy");
   }
@@ -1177,8 +1185,15 @@ ObjectDataHandler::write_ret ObjectDataHandler::overwrite(
     "data_base={}, offset=0x{:x}, len=0x{:x}, "
     "aligned_begin={}, aligned_end={}",
     ctx.t, data_base, offset, len,
-    unaligned_begin.get_aligned_laddr(ctx.tm.get_block_size()),
-    unaligned_end.get_roundup_laddr(ctx.tm.get_block_size()));
+    unaligned_begin.get_aligned_laddr(ctx.tm.get_block_size()), // 想下对齐
+    unaligned_end.get_roundup_laddr(ctx.tm.get_block_size())); // 向上对齐
+
+// overwreite_range_t
+// 原始开始位置 unaligned_begin
+// 原始结束位置 unaligned_end
+// 对齐后的开始位置 aligned_begin
+// 对齐后的结束位置 aligned_end
+// 实际写入长度 len
   return seastar::do_with(
     data_t{std::move(bl)},
     overwrite_range_t{
@@ -1188,11 +1203,22 @@ ObjectDataHandler::write_ret ObjectDataHandler::overwrite(
       ctx.tm.get_block_size()},
     [first_mapping=std::move(first_mapping),
     this, ctx](auto &data, auto &overwrite_range) {
-    if (overwrite_range.is_range_in_mapping(first_mapping)) {
+    // 对齐后的整个写入范围，是否完全包含在 first_mapping 中。 
+    //     first_mapping:
+    // |--------------------------------|
+
+    // write range:
+    //         |------------|
+    if (overwrite_range.is_range_in_mapping(first_mapping)) { 
       return handle_single_mapping_overwrite(
 	ctx, overwrite_range, data, std::move(first_mapping),
 	data.bl.has_value() ? op_type_t::OVERWRITE : op_type_t::ZERO);
     } else {
+  //       mapping A       mapping B       mapping C
+  // |----------|    |----------|    |----------|
+
+  // write range:
+  //       |---------------------------|
       return handle_multi_mapping_overwrite(
 	ctx, overwrite_range, data, std::move(first_mapping),
 	data.bl.has_value() ? op_type_t::OVERWRITE : op_type_t::ZERO);
@@ -1412,6 +1438,12 @@ ObjectDataHandler::write_ret ObjectDataHandler::write(
   objaddr_t offset,
   const bufferlist &bl)
 {
+//   Onode
+// └── layout
+//     ├── 对象大小
+//     └── object_data
+//         ├── 为该对象预留的逻辑地址起点
+//         └── 预留的逻辑地址长度
   return with_object_data(
     ctx,
     [this, ctx, offset, &bl](auto &object_data) {
@@ -1422,31 +1454,39 @@ ObjectDataHandler::write_ret ObjectDataHandler::write(
 	     bl.length(),
 	     object_data.get_reserved_data_base(),
 	     object_data.get_reserved_data_len(),
-             object_data.is_null());
+       object_data.is_null());
       return prepare_data_reservation(
-	ctx,
-	ctx.onode,
-	object_data,
-	p2roundup(offset + bl.length(), ctx.tm.get_block_size())
+        ctx,
+ctx.onode,
+      object_data,
+      // offset = 4096
+      // bl.length() = 1000
+      // block size = 4096
+
+      // 写结束位置 = 5096
+      // 对齐后 = 8192
+      p2roundup(offset + bl.length(), ctx.tm.get_block_size())
       ).si_then([this, ctx, offset, &object_data, &bl]
-		(auto mapping) -> write_ret {
-	auto data_base = object_data.get_reserved_data_base();
-	if (mapping) {
-	  return overwrite(
-	    ctx, data_base, offset, bl.length(),
-	    bufferlist(bl), std::move(*mapping));
-	}
-	laddr_offset_t l_start = data_base + offset;
-	return ctx.tm.get_containing_pin(
-	  ctx.t, l_start.get_aligned_laddr(ctx.tm.get_block_size())
-	).si_then([this, ctx, offset, data_base, &bl](auto pin) {
-	  return overwrite(
-	    ctx, data_base, offset, bl.length(),
-	    bufferlist(bl), std::move(pin));
-	}).handle_error_interruptible(
-	  write_iertr::pass_further{},
-	  crimson::ct_error::assert_all("unexpected enoent")
-	);
+        (auto mapping) -> write_ret {
+      // 当前对象的逻辑地址起点
+      auto data_base = object_data.get_reserved_data_base();
+      if (mapping) { // 对象刚刚创建了逻辑地址预留
+        return overwrite(
+          ctx, data_base, offset, bl.length(),
+          bufferlist(bl), std::move(*mapping));
+      }
+      // 获取旧mapping，然后voerwirt
+      laddr_offset_t l_start = data_base + offset;
+        return ctx.tm.get_containing_pin(
+          ctx.t, l_start.get_aligned_laddr(ctx.tm.get_block_size())
+        ).si_then([this, ctx, offset, data_base, &bl](auto pin) {
+          return overwrite(
+            ctx, data_base, offset, bl.length(),
+            bufferlist(bl), std::move(pin));
+        }).handle_error_interruptible(
+          write_iertr::pass_further{},
+          crimson::ct_error::assert_all("unexpected enoent")
+        );
       });
     });
 }

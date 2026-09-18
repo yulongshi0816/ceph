@@ -494,19 +494,20 @@ private:
       //       mostly in the recovery case, which is relatively rare compared
       //       to normal IO processing.
       if (edge_mapping.is_initial_pending()) {
-	return edge_handle_policy_t::MERGE_INPLACE;
+        // 表示对应的数据 extent 是当前事务中新建、还没有提交的 initial pending extent
+       	return edge_handle_policy_t::MERGE_INPLACE;
       } else {
-	return edge_handle_policy_t::DELTA_BASED_PUNCH;
+	      return edge_handle_policy_t::DELTA_BASED_PUNCH;
       }
     }
 
     // TODO: allow TRIM to do delta based overwrites. We forbid it
     // 	     now because it violate unit tests.
     if (op_type == op_type_t::TRIM ||
-	op_type == op_type_t::ZERO ||
-	len > delta_based_overwrite_max_extent_size ||
-	edge_mapping.is_zero_reserved() ||
-	edge_mapping.is_indirect()) {
+      op_type == op_type_t::ZERO ||
+      len > delta_based_overwrite_max_extent_size ||
+      edge_mapping.is_zero_reserved() ||
+      edge_mapping.is_indirect()) {
       return edge_handle_policy_t::REMAP;
     }
 

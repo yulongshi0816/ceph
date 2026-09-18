@@ -33,14 +33,17 @@ FuturizedStore::create(const std::string& type,
   }
 }
 
+// 将事务送到正确的 Store shard 执行，并在完成后回到原来的 CPU shard。
 seastar::future<> with_store_do_transaction(
   BackendStore store,
   FuturizedStore::Shard::CollectionRef ch,
   ceph::os::Transaction&& txn)
 {
+  // 取出所有回调，放在on_commit中
   std::unique_ptr<Context> on_commit(
     ceph::os::Transaction::collect_all_contexts(txn));
   const auto original_core = seastar::this_shard_id();
+  // store在当前核心
   if (store.shard_id == original_core || store.shard_id == GLOBAL_STORE) {
     return store.f_store.get_sharded_store(store.store_index).do_transaction_no_callbacks(
       std::move(ch), std::move(txn)

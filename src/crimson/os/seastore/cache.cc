@@ -2162,6 +2162,7 @@ void Cache::complete_commit(
 	assert(i->get_type() == extent_types_t::TEST_BLOCK_PHYSICAL);
 	alloc_laddr = L_ADDR_MIN;
       }
+      // paddr → laddr + len + type 创建Backref记录
       backref_entries.emplace_back(
 	backref_entry_t::create_alloc(
 	  i->get_paddr(),

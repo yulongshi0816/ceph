@@ -1790,13 +1790,16 @@ seastar::future<> SeaStore::Shard::do_transaction_no_callbacks(
   assert(store_active);
   ++(shard_stats.io_num);
 
+  // 事务入队
   auto& coll = static_cast<SeastoreCollection&>(*_ch);
   auto& entry = coll.pending_txns.emplace_back();
   entry.txn = std::move(_t);
+  // 这个事务是否能与其他事务合批
   entry.batchable = txn_is_batchable(entry.txn);
   auto fut = entry.pr.get_future();
   DEBUG("enqueue cid={} queue_depth={} in_flight={}",
         coll.get_cid(), coll.pending_txns.size(), coll.collection_in_flight);
+  // 这个 collection 当前没有调度协程在处理
   if (!coll.collection_in_flight) {
     coll.collection_in_flight = true;
     DEBUG("cid={} gate closed, starting dispatch", coll.get_cid());
@@ -1842,6 +1845,7 @@ seastar::future<> SeaStore::Shard::dispatch_collection(CollectionRef ch)
   LOG_PREFIX(SeaStoreS::dispatch_collection);
   auto& coll = static_cast<SeastoreCollection&>(*ch);
   while (!coll.pending_txns.empty()) {
+    // 事务的promise，即使事务合并了，也不减少，就是事务个数
     std::vector<seastar::promise<>> pending_txns_promises;
     auto merged = build_next_batch(coll, pending_txns_promises);
     DEBUG("draining {} txns from cid={}, committing batch ({} ops)",
@@ -1867,17 +1871,19 @@ seastar::future<> SeaStore::Shard::run_one_batch(
 
   auto flags = _t.get_fadvise_flags();
   internal_context_t ctx{
-    _ch, std::move(_t),
+    _ch,  // 当前collection
+    std::move(_t), // ctx.ext_transaction 上层传下的事务
     transaction_manager->create_transaction(
       Transaction::src_t::MUTATE,
       "do_transaction",
-      flags)
+      flags) // ctx.transaction seastore的内部事务
   };
 
   assert(shard_stats.starting_io_num);
   --(shard_stats.starting_io_num);
   ++(shard_stats.waiting_throttler_io_num);
 
+  // 同时有多少个 Store batch 可以进入 SeaStore 的事务处理过程
   auto t_pre_throttler = seastar::lowres_clock::now();
   co_await throttler.get(1);
   auto throttler_wait = seastar::lowres_clock::now() - t_pre_throttler;
@@ -1886,6 +1892,10 @@ seastar::future<> SeaStore::Shard::run_one_batch(
   --(shard_stats.waiting_throttler_io_num);
   ++(shard_stats.processing_inlock_io_num);
 
+  // seastore的事务冲突： 虽然seastore是在reactor的shard中运行，不会有多个线程修改内存，但不同事务
+  // 会在co_await之间交错
+  // 比如a读取版本10，IO期间co_await挂起，B修改版本为11，这个时候A继续往下，A的修改过期了，此时seatore
+  // 就把A标记为transaction conflict
   co_await with_repeat_trans_intr(
     [&, this] {
       // Preserve handle and rewind the external iterator before each attempt.
@@ -1895,16 +1905,16 @@ seastar::future<> SeaStore::Shard::run_one_batch(
     seastar::coroutine::lambda([&ctx, this, FNAME](auto &t)
 			       -> tm_ret {
       ++(shard_stats.repeat_io_num);
-#ifndef NDEBUG
-      TRACET(" transaction dump:\n", t);
-      JSONFormatter f(true);
-      f.open_object_section("transaction");
-      ctx.ext_transaction.dump(&f);
-      f.close_section();
-      std::stringstream str;
-      f.flush(str);
-      TRACET("{}", t, str.str());
-#endif
+    #ifndef NDEBUG
+          TRACET(" transaction dump:\n", t);
+          JSONFormatter f(true);
+          f.open_object_section("transaction");
+          ctx.ext_transaction.dump(&f);
+          f.close_section();
+          std::stringstream str;
+          f.flush(str);
+          TRACET("{}", t, str.str());
+    #endif
 
       DEBUGT("cid={}, {} operations, 0x{:x} bytes, {} colls, {} objects ...",
 	     t, ctx.ch->get_cid(),
@@ -1925,8 +1935,8 @@ seastar::future<> SeaStore::Shard::run_one_batch(
 
         DEBUGT("processing op {} of {} for cid={}",
                t, current_op, total_ops, ctx.ch->get_cid());
-	co_await _do_transaction_step(
-	  ctx, ctx.ch, onodes, ctx.iter);
+      co_await _do_transaction_step(
+        ctx, ctx.ch, onodes, ctx.iter);
       }
       ctx.build_time += seastar::lowres_clock::now() - build_start;
 
@@ -2186,8 +2196,8 @@ SeaStore::Shard::_do_transaction_step(
         DEBUGT("op WRITE, oid={}, 0x{:x}~0x{:x}, flags=0x{:x} ...",
                *ctx.transaction, oid, off, len, fadvise_flags);
         return _write(
-	  ctx, *onode, off, len, std::move(bl),
-	  fadvise_flags);
+        ctx, *onode, off, len, std::move(bl),
+        fadvise_flags);
       }
       case Transaction::OP_TRUNCATE:
       {
@@ -2511,7 +2521,7 @@ SeaStore::Shard::_write(
     return crimson::ct_error::input_output_error::make();
   }
   const auto &object_size = onode.get_layout().size;
-  if (offset + len > object_size) {
+  if (offset + len > object_size) { // 更新onode的对象大小
     onode.update_onode_size(
       *ctx.transaction,
       std::max<uint64_t>(offset + len, object_size));
@@ -2520,17 +2530,17 @@ SeaStore::Shard::_write(
     std::move(_bl),
     ObjectDataHandler(max_object_size),
     [=, this, &ctx, &onode](auto &bl, auto &objhandler)
-  {
-    return _maybe_copy_on_write(ctx, onode, objhandler
-    ).si_then([&ctx, &onode, &objhandler, offset, &bl, this] {
-      return objhandler.write(
-	ObjectDataHandler::context_t{
-	  *transaction_manager,
-	  *ctx.transaction,
-	  onode,
-	},
-	offset,
-	bl);
+      {
+        return _maybe_copy_on_write(ctx, onode, objhandler
+        ).si_then([&ctx, &onode, &objhandler, offset, &bl, this] {
+          return objhandler.write(
+      ObjectDataHandler::context_t{
+        *transaction_manager,
+        *ctx.transaction,
+        onode,
+      },
+      offset,
+      bl);
     });
   });
 }
