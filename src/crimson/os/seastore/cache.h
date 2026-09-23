@@ -1480,7 +1480,7 @@ public:
     // Cache::root should have been inserted to the dirty list
     assert(root->is_stable_dirty());
     std::vector<CachedExtentRef> _dirty;
-    for (auto &e : extents_index) {
+    for (auto &e : extents_index) { // 复制cache中extent引用
       _dirty.push_back(CachedExtentRef(&e));
     }
     return seastar::do_with(
@@ -1493,12 +1493,13 @@ public:
         [this, FNAME, &t, &f](auto &e)
       {
         SUBTRACET(seastore_cache, "inspecting extent ... -- {}", t, *e);
+        // 这个f是传进来的回调，根据extent类型选择manger
         return f(t, e
         ).si_then([this, FNAME, &t, e](bool is_alive) {
-          if (!is_alive) {
+          if (!is_alive) { // 索引无效
             SUBDEBUGT(seastore_cache, "extent is not alive, remove extent -- {}", t, *e);
             remove_extent(e, nullptr);
-	    e->set_invalid(t);
+	          e->set_invalid(t);
           } else {
             SUBDEBUGT(seastore_cache, "extent is alive -- {}", t, *e);
           }

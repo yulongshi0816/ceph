@@ -13,82 +13,85 @@ RecordScanner::scan_valid_records_ret
 RecordScanner::scan_valid_records(
   scan_valid_records_cursor &cursor,
   segment_nonce_t nonce,
-  size_t budget,
+  size_t budget, // 最多扫多少字节
   found_record_handler_t &handler)
 {
   LOG_PREFIX(RecordScanner::scan_valid_records);
   initialize_cursor(cursor);
   DEBUG("starting at {}, budget=0x{:x}", cursor, budget);
   auto retref = std::make_unique<size_t>(0);
-  auto &budget_used = *retref;
+  auto &budget_used = *retref; // 本次扫描的字节
   return crimson::repeat(
     [=, &cursor, &budget_used, &handler, this]() mutable
     -> scan_valid_records_ertr::future<seastar::stop_iteration> {
       return [=, &handler, &cursor, &budget_used, this] {
-	if (!cursor.last_valid_header_found) {
-	  return read_validate_record_metadata(cursor, nonce
-	  ).safe_then([=, &cursor](auto md) {
-	    if (!md) {
-	      cursor.last_valid_header_found = true;
-	      if (cursor.is_complete()) {
-	        INFO("complete at {}, invalid record group metadata",
-                     cursor);
-	      } else {
-	        DEBUG("found invalid record group metadata at {}, "
-	              "processing {} pending record groups",
-	              cursor.seq,
-	              cursor.pending_record_groups.size());
-	      }
-	      return scan_valid_records_ertr::now();
-	    } else {
-	      auto& [header, md_bl] = *md;
-	      DEBUG("found valid {} at {}", header, cursor.seq);
-	      cursor.emplace_record_group(header, std::move(md_bl));
-	      return scan_valid_records_ertr::now();
-	    }
-	  }).safe_then([=, &cursor, &budget_used, &handler, this] {
-	    DEBUG("processing committed record groups until {}, {} pending",
-		  cursor.last_committed,
-		  cursor.pending_record_groups.size());
-	    return crimson::repeat(
-	      [=, &budget_used, &cursor, &handler, this] {
-		if (cursor.pending_record_groups.empty()) {
-		  /* This is only possible if the segment is empty.
-		   * A record's last_commited must be prior to its own
-		   * location since it itself cannot yet have been committed
-		   * at its own time of submission.  Thus, the most recently
-		   * read record must always fall after cursor.last_committed */
-		  return scan_valid_records_ertr::make_ready_future<
-		    seastar::stop_iteration>(seastar::stop_iteration::yes);
-		}
-		auto &next = cursor.pending_record_groups.front();
-		journal_seq_t next_seq = {cursor.seq.segment_seq, next.offset};
-		if (cursor.last_committed == JOURNAL_SEQ_NULL ||
-		    next_seq > cursor.last_committed) {
-		  return scan_valid_records_ertr::make_ready_future<
-		    seastar::stop_iteration>(seastar::stop_iteration::yes);
-		}
-		return consume_next_records(cursor, handler, budget_used
-		).safe_then([] {
-		  return scan_valid_records_ertr::make_ready_future<
-		    seastar::stop_iteration>(seastar::stop_iteration::no);
-		});
-	      });
-	  });
-	} else {
-	  assert(!cursor.pending_record_groups.empty());
-	  auto &next = cursor.pending_record_groups.front();
-	  return read_validate_data(next.offset, next.header
-	  ).safe_then([this, FNAME, &budget_used, &cursor, &handler, &next](auto valid) {
-	    if (!valid) {
-	      INFO("complete at {}, invalid record group data at {}, {}",
-		   cursor, next.offset, next.header);
-	      cursor.pending_record_groups.clear();
-	      return scan_valid_records_ertr::now();
-	    }
-            return consume_next_records(cursor, handler, budget_used);
-	  });
-	}
+        if (!cursor.last_valid_header_found) { // 继续向前读header
+          return read_validate_record_metadata(cursor, nonce
+          ).safe_then([=, &cursor](auto md) {
+            if (!md) { // 有效的jouranl metadata到这结束了
+              cursor.last_valid_header_found = true;
+              if (cursor.is_complete()) {
+                INFO("complete at {}, invalid record group metadata",
+                          cursor);
+              } else {
+                DEBUG("found invalid record group metadata at {}, "
+                      "processing {} pending record groups",
+                      cursor.seq,
+                      cursor.pending_record_groups.size());
+              }
+              return scan_valid_records_ertr::now();
+            } else {
+              auto& [header, md_bl] = *md;
+              DEBUG("found valid {} at {}", header, cursor.seq);
+              cursor.emplace_record_group(header, std::move(md_bl));
+              return scan_valid_records_ertr::now();
+            }
+          }).safe_then([=, &cursor, &budget_used, &handler, this] {
+            DEBUG("processing committed record groups until {}, {} pending",
+            cursor.last_committed,
+            cursor.pending_record_groups.size());
+            return crimson::repeat(
+              [=, &budget_used, &cursor, &handler, this] {
+          if (cursor.pending_record_groups.empty()) {
+            /* This is only possible if the segment is empty.
+            * A record's last_commited must be prior to its own
+            * location since it itself cannot yet have been committed
+            * at its own time of submission.  Thus, the most recently
+            * read record must always fall after cursor.last_committed */
+            return scan_valid_records_ertr::make_ready_future<
+              seastar::stop_iteration>(seastar::stop_iteration::yes);
+          }
+          // pending_record_groups 保存“metadata 已经有效，但完整提交状态还需要确认
+          // ”的 Group；后续 Group 的 committed_to 可以确认前面的 Group，最后无人确认
+          // 的 Group 则通过读取 data 和校验 CRC 来确认。
+          auto &next = cursor.pending_record_groups.front();
+          journal_seq_t next_seq = {cursor.seq.segment_seq, next.offset};
+          if (cursor.last_committed == JOURNAL_SEQ_NULL ||
+              next_seq > cursor.last_committed) {
+            return scan_valid_records_ertr::make_ready_future<
+              seastar::stop_iteration>(seastar::stop_iteration::yes);
+          }
+          return consume_next_records(cursor, handler, budget_used
+          ).safe_then([] {
+            return scan_valid_records_ertr::make_ready_future<
+              seastar::stop_iteration>(seastar::stop_iteration::no);
+          });
+              });
+          });
+        } else {
+          assert(!cursor.pending_record_groups.empty());
+          auto &next = cursor.pending_record_groups.front();
+          return read_validate_data(next.offset, next.header
+          ).safe_then([this, FNAME, &budget_used, &cursor, &handler, &next](auto valid) {
+            if (!valid) {
+              INFO("complete at {}, invalid record group data at {}, {}",
+            cursor, next.offset, next.header);
+              cursor.pending_record_groups.clear();
+              return scan_valid_records_ertr::now();
+            }
+                  return consume_next_records(cursor, handler, budget_used);
+          });
+        }
       }().safe_then([=, &budget_used, &cursor] {
 	if (cursor.is_complete() || budget_used >= budget) {
 	  DEBUG("finish at {}, budget_used=0x{:x}, budget=0x{:x}",
@@ -200,6 +203,7 @@ RecordScanner::read_validate_data_ret RecordScanner::read_validate_data(
   });
 }
 
+// 把 pending 队列最前面的一个 Record Group 交给之前的 record_group_handler。
 RecordScanner::consume_record_group_ertr::future<>
 RecordScanner::consume_next_records(
   scan_valid_records_cursor& cursor,

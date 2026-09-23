@@ -339,119 +339,121 @@ BtreeBackrefManager::scan_mapped_space(
   {
     auto block_size = cache.get_block_size();
     // traverse leaf-node entries
+    // 准备好backfref树访问对象-》交给f
     return with_btree<BackrefBtree>(
       cache, c,
       [c, &scan_visitor, block_size, FNAME](auto &btree)
     {
       return BackrefBtree::iterate_repeat(
-	c,
-	btree.lower_bound(
-	  c,
-	  P_ADDR_MIN),
-	[c, &scan_visitor, block_size, FNAME](auto &pos) {
-	  if (pos.is_end()) {
-	    return BackrefBtree::iterate_repeat_ret_inner(
-	      interruptible::ready_future_marker{},
-	      seastar::stop_iteration::yes);
-	  }
-	  TRACET("tree value {}~{} {}~{} {} used",
-		 c.trans,
-		 pos.get_key(),
-		 pos.get_val().len,
-		 pos.get_val().laddr,
-		 pos.get_val().len,
-		 pos.get_val().type);
-	  ceph_assert(pos.get_key().is_absolute());
-	  ceph_assert(pos.get_val().len > 0 &&
-		      pos.get_val().len % block_size == 0);
-	  ceph_assert(!is_backref_node(pos.get_val().type));
-	  ceph_assert(pos.get_val().laddr != L_ADDR_NULL);
-	  scan_visitor(
-	      pos.get_key(),
-	      P_ADDR_NULL,
-	      pos.get_val().len,
-	      pos.get_val().type,
-	      pos.get_val().laddr);
-	  return BackrefBtree::iterate_repeat_ret_inner(
-	    interruptible::ready_future_marker{},
-	    seastar::stop_iteration::no);
-	}
+          c,
+        btree.lower_bound(
+          c,
+          P_ADDR_MIN), // Backref 树中，第一个 key 大于等于 P_ADDR_MIN 的条目。
+        [c, &scan_visitor, block_size, FNAME](auto &pos) {
+          if (pos.is_end()) {
+            return BackrefBtree::iterate_repeat_ret_inner(
+              interruptible::ready_future_marker{},
+              seastar::stop_iteration::yes); // yes代表结束，停止循环
+          }
+          TRACET("tree value {}~{} {}~{} {} used",
+          c.trans,
+          pos.get_key(),
+          pos.get_val().len,
+          pos.get_val().laddr,
+          pos.get_val().len,
+          pos.get_val().type);
+          ceph_assert(pos.get_key().is_absolute());
+          ceph_assert(pos.get_val().len > 0 &&
+                pos.get_val().len % block_size == 0);
+          ceph_assert(!is_backref_node(pos.get_val().type));
+          ceph_assert(pos.get_val().laddr != L_ADDR_NULL);
+          scan_visitor(
+              pos.get_key(),
+              P_ADDR_NULL,
+              pos.get_val().len,
+              pos.get_val().type,
+              pos.get_val().laddr); // 登记
+          return BackrefBtree::iterate_repeat_ret_inner(
+            interruptible::ready_future_marker{},
+            seastar::stop_iteration::no); // 不停止继续
+        }
       );
     }).si_then([this, &scan_visitor, c, FNAME, block_size] {
-      // traverse alloc-deltas in order
+      // traverse alloc-deltas in order 处理cache中的增量
       auto &backref_entryrefs = cache.get_backref_entryrefs_by_seq();
       for (auto &[seq, refs] : backref_entryrefs) {
-	boost::ignore_unused(seq);
-	DEBUGT("scan {} backref entries", c.trans, refs.size());
-	for (auto &backref_entry : refs) {
-	  if (backref_entry->laddr == L_ADDR_NULL) {
-	    TRACET("backref entry {}~{} {} free",
-		   c.trans,
-		   backref_entry->paddr,
-		   backref_entry->len,
-		   backref_entry->type);
-	  } else {
-	    TRACET("backref entry {}~{} {}~{} {} used",
-		   c.trans,
-		   backref_entry->paddr,
-		   backref_entry->len,
-		   backref_entry->laddr,
-		   backref_entry->len,
-		   backref_entry->type);
-	  }
-	  ceph_assert(backref_entry->paddr.is_absolute());
-	  ceph_assert(backref_entry->len > 0 &&
-		      backref_entry->len % block_size == 0);
-	  ceph_assert(!is_backref_node(backref_entry->type));
-	  scan_visitor(
-	    backref_entry->paddr,
-	    P_ADDR_NULL,
-	    backref_entry->len,
-	    backref_entry->type,
-	    backref_entry->laddr);
-	}
+        boost::ignore_unused(seq);
+        DEBUGT("scan {} backref entries", c.trans, refs.size());
+        for (auto &backref_entry : refs) {
+          if (backref_entry->laddr == L_ADDR_NULL) { // 释放
+            TRACET("backref entry {}~{} {} free",
+            c.trans,
+            backref_entry->paddr,
+            backref_entry->len,
+            backref_entry->type);
+          } else {
+            TRACET("backref entry {}~{} {}~{} {} used",
+            c.trans,
+            backref_entry->paddr,
+            backref_entry->len,
+            backref_entry->laddr,
+            backref_entry->len,
+            backref_entry->type);
+          }
+          ceph_assert(backref_entry->paddr.is_absolute());
+          ceph_assert(backref_entry->len > 0 &&
+                backref_entry->len % block_size == 0);
+          ceph_assert(!is_backref_node(backref_entry->type));
+          scan_visitor(
+            backref_entry->paddr,
+            P_ADDR_NULL,
+            backref_entry->len,
+            backref_entry->type,
+            backref_entry->laddr);
+        }
       }
     }).si_then([this, &scan_visitor, block_size, c, FNAME] {
+      // 统计Backref树节点自身的空间
       BackrefBtree::mapped_space_visitor_t f =
-	[&scan_visitor, block_size, FNAME, c](
-	  paddr_t paddr, paddr_t key, extent_len_t len,
-	  depth_t depth, extent_types_t type, BackrefBtree::iterator&) {
-	TRACET("tree node {}~{} {}, depth={} used",
-	       c.trans, paddr, len, type, depth);
-	ceph_assert(paddr.is_absolute());
-	ceph_assert(len > 0 && len % block_size == 0);
-	ceph_assert(depth >= 1);
-	ceph_assert(is_backref_node(type));
-	return scan_visitor(paddr, key, len, type, L_ADDR_NULL);
+        [&scan_visitor, block_size, FNAME, c](
+          paddr_t paddr, paddr_t key, extent_len_t len,
+          depth_t depth, extent_types_t type, BackrefBtree::iterator&) {
+        TRACET("tree node {}~{} {}, depth={} used",
+              c.trans, paddr, len, type, depth);
+        ceph_assert(paddr.is_absolute());
+        ceph_assert(len > 0 && len % block_size == 0);
+        ceph_assert(depth >= 1);
+        ceph_assert(is_backref_node(type));
+        return scan_visitor(paddr, key, len, type, L_ADDR_NULL);
       };
       return seastar::do_with(
-	std::move(f),
-	[this, c](auto &tree_visitor)
-      {
-	// traverse internal-node entries
-	return with_btree<BackrefBtree>(
-	  cache, c,
-	  [c, &tree_visitor](auto &btree)
-	{
-	  return BackrefBtree::iterate_repeat(
-	    c,
-	    btree.lower_bound(
-	      c,
-	      P_ADDR_MIN,
-	      &tree_visitor),
-	    [](auto &pos) {
-	      if (pos.is_end()) {
-		return BackrefBtree::iterate_repeat_ret_inner(
-		  interruptible::ready_future_marker{},
-		  seastar::stop_iteration::yes);
-	      }
-	      return BackrefBtree::iterate_repeat_ret_inner(
-		interruptible::ready_future_marker{},
-		seastar::stop_iteration::no);
-	    },
-	    &tree_visitor
-	  );
-	});
+        std::move(f),
+        [this, c](auto &tree_visitor) // tree_visitor： 负责吧树节点转交给scan_vistor
+            {
+        // traverse internal-node entries
+        return with_btree<BackrefBtree>(
+          cache, c,
+          [c, &tree_visitor](auto &btree)
+        {
+          return BackrefBtree::iterate_repeat(
+            c,
+            btree.lower_bound(
+              c,
+              P_ADDR_MIN,
+              &tree_visitor),
+            [](auto &pos) {
+              if (pos.is_end()) {
+                return BackrefBtree::iterate_repeat_ret_inner(
+                  interruptible::ready_future_marker{},
+                  seastar::stop_iteration::yes);
+              }
+              return BackrefBtree::iterate_repeat_ret_inner(
+                interruptible::ready_future_marker{},
+                seastar::stop_iteration::no);
+            },
+            &tree_visitor
+          );
+        });
       });
     });
   });

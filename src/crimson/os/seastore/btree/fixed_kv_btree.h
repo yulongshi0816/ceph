@@ -1196,32 +1196,32 @@ public:
       iter_fut
     ).si_then([c, visitor, f=std::forward<F>(f)](auto iter) {
       return seastar::do_with(
-	iter,
-	std::move(f),
-	[c, visitor](auto &pos, auto &f) {
-	  return trans_intr::repeat(
-	    [c, visitor, &f, &pos] {
-	      return f(
-		pos
-	      ).si_then([c, visitor, &pos](auto done) {
-		if (done == seastar::stop_iteration::yes) {
-		  return iterate_repeat_ret_inner(
-		    interruptible::ready_future_marker{},
-		    seastar::stop_iteration::yes);
-		} else {
-		  ceph_assert(!pos.is_end());
-		  return pos.next(
-		    c, visitor
-		  ).si_then([&pos](auto next) {
-		    pos = next;
-		    return iterate_repeat_ret_inner(
-		      interruptible::ready_future_marker{},
-		      seastar::stop_iteration::no);
-		  });
-		}
-	      });
-	    });
-	});
+      iter,
+      std::move(f),
+      [c, visitor](auto &pos, auto &f) {
+        return trans_intr::repeat(
+          [c, visitor, &f, &pos] {
+            return f(
+              pos
+            ).si_then([c, visitor, &pos](auto done) {
+              if (done == seastar::stop_iteration::yes) {
+                return iterate_repeat_ret_inner(
+                  interruptible::ready_future_marker{},
+                  seastar::stop_iteration::yes);
+              } else {
+                ceph_assert(!pos.is_end());
+                return pos.next(
+                  c, visitor
+                ).si_then([&pos](auto next) {
+                  pos = next;
+                  return iterate_repeat_ret_inner(
+                    interruptible::ready_future_marker{},
+                    seastar::stop_iteration::no);
+                });
+              }
+            });
+          });
+      });
     });
   }
 

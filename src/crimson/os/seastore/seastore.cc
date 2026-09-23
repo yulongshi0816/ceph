@@ -454,8 +454,10 @@ Device::access_ertr::future<> SeaStore::_mount()
   INFO("...");
 
   ceph_assert(seastar::this_shard_id() == primary_core);
+  // 打开底层设备，读取 SeaStore 在 mkfs 时写入的设备 superblock，校验设备信息，并让每个 shard 找到自己管理的物理区域。
   co_await device->mount();
   {
+    // 这是确认底层设备的逻辑块大小满足 SeaStore 的最小地址单位
     auto block_size = device->get_sharded_device(0).get_block_size();
     ceph_assertf(block_size >= laddr_t::UNIT_SIZE,
                  "seastore requires a device block size of at least %u bytes, "
@@ -488,6 +490,7 @@ Device::access_ertr::future<> SeaStore::_mount()
     secondaries.emplace_back(std::move(sec_dev));
     co_await set_secondaries();
   }
+  // 让所有 Seastar core 上的本地 shard_stores 分别执行恢复。
   co_await shard_stores.invoke_on_all([](auto &local_store) {
     return seastar::do_for_each(local_store.mshard_stores, [](auto& mshard_store) {
       return mshard_store->mount_managers();
@@ -3070,11 +3073,21 @@ void SeaStore::Shard::init_managers()
   assert(store_active);
   LOG_PREFIX(SeaStore::init_managers);
   DEBUG("start");
+  // 清理
   transaction_manager.reset();
   collection_manager.reset();
   onode_manager.reset();
   shard_stats = {};
 
+//   TransactionManager
+// ├── Journal
+// ├── Cache 内存中的extent
+// ├── LBA Manager laddr->paddr
+// ├── Backref Manager paddr → laddr + 长度 + extent 类型
+// └── Extent Placement Manager
+//     ├── main Cleaner
+//     ├── cold Cleaner（可选）
+//     └── Journal Trimmer
   transaction_manager = make_transaction_manager(
       device, secondaries, shard_stats, store_index, is_test);
   collection_manager = std::make_unique<collection_manager::FlatCollectionManager>(

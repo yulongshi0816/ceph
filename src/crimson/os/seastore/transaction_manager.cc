@@ -117,28 +117,32 @@ TransactionManager::mount()
   cache->init();
   return epm->mount(
   ).safe_then([this] {
+    // 让 Journal 扫描磁盘；每当 Journal 解码出一个 delta，就调用这个 lambda，把 delta 交给 Cache 应用。
     return journal->replay(
       [this](
-	const auto &offsets,
-	const auto &e,
-	const journal_seq_t &dirty_tail,
-	const journal_seq_t &alloc_tail,
-	sea_time_point modify_time)
-      {
-	auto start_seq = offsets.write_result.start_seq;
-	return cache->replay_delta(
-	  start_seq,
-	  offsets.record_block_base,
-	  e,
-	  dirty_tail,
-	  alloc_tail,
-	  modify_time);
+      const auto &offsets,
+      const auto &e, //具体的delta
+      const journal_seq_t &dirty_tail,
+      const journal_seq_t &alloc_tail,
+      sea_time_point modify_time) {
+        // delta来自journal的哪个位置
+        auto start_seq = offsets.write_result.start_seq;
+        return cache->replay_delta(
+          start_seq,
+          offsets.record_block_base, // 物理基准地址
+          e,
+          dirty_tail,
+          alloc_tail,
+          modify_time);
       });
   }).safe_then([this] {
-    return journal->open_for_mount();
+    return journal->open_for_mount(); // 打开新的journal segentmet
   }).safe_then([this](auto start_seq) {
+    // 回放的旧的jouranl的seq+1
+    // journal_head jouranl当前最新写的位置，jouranl tailljouranl最早不能删的位置
+    // [journal_tail, journal_head]
     journal->get_trimmer().set_journal_head(start_seq);
-    return with_transaction_weak(
+    return with_transaction_weak( //   创建一个轻量只读 Transaction
       "mount",
       CACHE_HINT_TOUCH,
       [this](auto &t)
@@ -150,8 +154,8 @@ TransactionManager::mount()
           return lba_manager->init_cached_extent(t, e);
         }
       }).si_then([this, &t] {
-        epm->start_scan_space();
-        if (can_drop_backref()) {
+        epm->start_scan_space(); // 从MOUNT->SCAN_SPACE状态，初始化
+        if (can_drop_backref()) { // RBM
           return lba_manager->scan_mapped_space(
             t,
             [this](
@@ -167,7 +171,7 @@ TransactionManager::mount()
               logical_bucket->move_to_top(laddr.get_object_prefix());
             }
           });
-        } else {
+        } else { // 正常
           return backref_manager->scan_mapped_space(
             t,
             [this](
@@ -202,9 +206,9 @@ TransactionManager::mount()
       });
     });
   }).safe_then([this] {
-    return epm->open_for_write();
+    return epm->open_for_write(); // 准备数据／元数据写入器
   }).safe_then([FNAME, this] {
-    epm->start_background();
+    epm->start_background(); // 切换状态为running
     cache->boot_done();
     INFO("done");
   }).handle_error(

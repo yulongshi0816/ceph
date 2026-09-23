@@ -2299,8 +2299,13 @@ void Cache::init()
   }
   root = CachedExtent::make_cached_extent_ref<RootBlock>();
   // Make it simpler to keep root dirty
+  //   RootBlock
+  // ├── LBA Tree root
+  // ├── Backref Tree root
+  // ├── 其他全局持久化入口
+  // └── 相关内部状态
   root->init(CachedExtent::extent_state_t::DIRTY,
-             P_ADDR_ROOT,
+             P_ADDR_ROOT, // 特殊地址，标记逻辑RootBlock
              PLACEMENT_HINT_NULL,
              NULL_GENERATION,
              nullptr,
@@ -2349,9 +2354,9 @@ Cache::close_ertr::future<> Cache::close()
 
 Cache::replay_delta_ret
 Cache::replay_delta(
-  journal_seq_t journal_seq,
-  paddr_t record_base,
-  const delta_info_t &delta,
+  journal_seq_t journal_seq, // 当前Delta来自jouranl的哪个位置
+  paddr_t record_base, // record的物理基准地址
+  const delta_info_t &delta, // 具体变更
   const journal_seq_t &dirty_tail,
   const journal_seq_t &alloc_tail,
   sea_time_point modify_time)
@@ -2372,31 +2377,33 @@ Cache::replay_delta(
    * have been rewritten.
    */
   if (delta.paddr.is_absolute_segmented()) {
+    // 当前 Delta 指向的物理 Segment，是否仍然是当初生成该 Delta 时的那一轮 Segment。
     auto& seg_addr = delta.paddr.as_seg_paddr();
     auto seg_info = get_segment_info(seg_addr.get_segment_id());
     if (seg_info) {
       auto delta_paddr_segment_seq = seg_info->seq;
       auto delta_paddr_segment_type = seg_info->type;
       if (delta_paddr_segment_seq != delta.ext_seq ||
-          delta_paddr_segment_type != delta.seg_type) {
+          delta_paddr_segment_type != delta.seg_type) { // seq不对，已经被重用了
         DEBUG("delta is obsolete, delta_paddr_segment_seq={},"
               " delta_paddr_segment_type={} -- {}",
               segment_seq_printer_t{delta_paddr_segment_seq},
               delta_paddr_segment_type,
               delta);
         return replay_delta_ertr::make_ready_future<std::pair<bool, CachedExtentRef>>(
-	  std::make_pair(false, nullptr));
+	        std::make_pair(false, nullptr));
       }
     }
   }
 
-  if (delta.type == extent_types_t::JOURNAL_TAIL) {
+  if (delta.type == extent_types_t::JOURNAL_TAIL) { // 处理过
     // this delta should have been dealt with during segment cleaner mounting
     return replay_delta_ertr::make_ready_future<std::pair<bool, CachedExtentRef>>(
       std::make_pair(false, nullptr));
   }
 
-  // replay alloc
+  // replay alloc 这次事务分配或释放了哪些物理空间
+  // 这些物理空间对应哪个逻辑地址和 extent 类型
   if (delta.type == extent_types_t::ALLOC_INFO) {
     if (can_drop_backref()) {
       return replay_delta_ertr::make_ready_future<
@@ -2405,32 +2412,36 @@ Cache::replay_delta(
 
     if (journal_seq < alloc_tail) {
       DEBUG("journal_seq {} < alloc_tail {}, don't replay {}",
-	journal_seq, alloc_tail, delta);
-      return replay_delta_ertr::make_ready_future<std::pair<bool, CachedExtentRef>>(
-	std::make_pair(false, nullptr));
+      journal_seq, alloc_tail, delta);
+          return replay_delta_ertr::make_ready_future<std::pair<bool, CachedExtentRef>>(
+      std::make_pair(false, nullptr));
     }
 
     alloc_delta_t alloc_delta;
     decode(alloc_delta, delta.bl);
     backref_entry_refs_t backref_entries;
+    // alloc_blk_ranges
+    // ├── P1000，4 KiB，L100，对象数据 (paddr, len, laddr,type)
+    // ├── P2000，8 KiB，L200，LBA节点
+    // └── P3000，4 KiB，L300，Onode节点
     for (auto &alloc_blk : alloc_delta.alloc_blk_ranges) {
       if (is_backref_node(alloc_blk.type)) {
-	// On startup, BackrefManager::scan_mapped_space() will scan all
-	// mappings and internal entries to rebuild the space management.
-	// It's unnecessary to apply the alloc deltas of backref extents
-	// to the cached backref entries and these deltas are only used
-	// to skip invalid deltas for RBM backends.
-	continue;
+        // On startup, BackrefManager::scan_mapped_space() will scan all
+        // mappings and internal entries to rebuild the space management.
+        // It's unnecessary to apply the alloc deltas of backref extents
+        // to the cached backref entries and these deltas are only used
+        // to skip invalid deltas for RBM backends. 跳过自身
+        continue;
       }
-      if (alloc_blk.paddr.is_record_relative()) {
-	alloc_blk.paddr = record_base.add_relative(alloc_blk.paddr);
+      if (alloc_blk.paddr.is_record_relative()) { // paddr是相对地址，要先转为绝对地址
+        alloc_blk.paddr = record_base.add_relative(alloc_blk.paddr);
       } else {
         ceph_assert(alloc_blk.paddr.is_absolute());
       }
       DEBUG("replay alloc_blk {}~0x{:x} {}, journal_seq: {}",
-	alloc_blk.paddr, alloc_blk.len, alloc_blk.laddr, journal_seq);
-      backref_entries.emplace_back(
-	backref_entry_t::create(alloc_blk));
+      alloc_blk.paddr, alloc_blk.len, alloc_blk.laddr, journal_seq);
+          backref_entries.emplace_back(
+      backref_entry_t::create(alloc_blk));
     }
     commit_backref_entries(std::move(backref_entries), journal_seq);
     return replay_delta_ertr::make_ready_future<std::pair<bool, CachedExtentRef>>(
@@ -2446,10 +2457,13 @@ Cache::replay_delta(
   }
 
   if (is_root_type(delta.type)) {
+    // 是root
     TRACE("replay root delta at {} {}, remove extent ... -- {}, prv_root={}",
           journal_seq, record_base, delta, *root);
     ceph_assert(delta.paddr.is_root());
-    remove_extent(root, nullptr);
+    remove_extent(root, nullptr); // 取消cache登记
+    //     用 Journal Delta 中保存的完整 root_t
+    // 覆盖当前 RootBlock 里的 root_t
     root->apply_delta_and_adjust_crc(record_base, delta.bl);
     root->dirty_from = journal_seq;
     root->state = CachedExtent::extent_state_t::DIRTY;
@@ -2461,8 +2475,9 @@ Cache::replay_delta(
     add_to_dirty(root, nullptr);
     return replay_delta_ertr::make_ready_future<std::pair<bool, CachedExtentRef>>(
       std::make_pair(true, root));
-  } else {
+  } else { // 普通元数据的分支
     ceph_assert(delta.paddr.is_absolute());
+    // 按 paddr 查询 Cache, cache中存在，等待可能正在进行的io完成，不存在就返回空引用
     auto _get_extent_if_cached = [this](paddr_t addr)
       -> get_extent_ertr::future<CachedExtentRef> {
       // replay is not included by the cache hit metrics
@@ -2475,8 +2490,9 @@ Cache::replay_delta(
         return seastar::make_ready_future<CachedExtentRef>();
       }
     };
+    // pversion == 0 表示这是 replay 过程中针对该稳定 extent 的第一条修改
     auto extent_fut = (delta.pversion == 0 ?
-      do_get_caching_extent_by_type(
+      do_get_caching_extent_by_type( // 从磁盘读，并放入cache
         delta.type,
         delta.paddr,
         delta.laddr,
@@ -2492,7 +2508,7 @@ Cache::replay_delta(
           touch_extent_fully(ext, nullptr, CACHE_HINT_TOUCH);
         },
         nullptr) :
-      _get_extent_if_cached(
+      _get_extent_if_cached( // 只在cache中查找
 	delta.paddr)
     ).handle_error(
       replay_delta_ertr::pass_further{},
@@ -2501,44 +2517,46 @@ Cache::replay_delta(
       )
     );
     return extent_fut.safe_then([=, this, &delta](auto extent) {
-      if (!extent) {
-	DEBUG("replay extent is not present, so delta is obsolete at {} {} -- {}",
-	      journal_seq, record_base, delta);
-	assert(delta.pversion > 0);
-	return replay_delta_ertr::make_ready_future<std::pair<bool, CachedExtentRef>>(
-	  std::make_pair(false, nullptr));
+      if (!extent) { // 没找到extent
+        DEBUG("replay extent is not present, so delta is obsolete at {} {} -- {}",
+              journal_seq, record_base, delta);
+        assert(delta.pversion > 0);
+        return replay_delta_ertr::make_ready_future<std::pair<bool, CachedExtentRef>>(
+          std::make_pair(false, nullptr));
       }
 
       DEBUG("replay extent delta at {} {} ... -- {}, prv_extent={}",
             journal_seq, record_base, delta, *extent);
 
       if (delta.paddr.is_absolute_segmented() ||
-	  !can_inplace_rewrite(delta.type)) {
-	ceph_assert_always(extent->last_committed_crc == delta.prev_crc);
-	assert(extent->version == delta.pversion);
-	extent->apply_delta_and_adjust_crc(record_base, delta.bl);
-	extent->set_modify_time(modify_time);
-	ceph_assert_always(extent->last_committed_crc == delta.final_crc);
+        !can_inplace_rewrite(delta.type)) {
+        ceph_assert_always(extent->last_committed_crc == delta.prev_crc);
+        assert(extent->version == delta.pversion); // 检查version
+        extent->apply_delta_and_adjust_crc(record_base, delta.bl); // 应用
+        extent->set_modify_time(modify_time);
+        ceph_assert_always(extent->last_committed_crc == delta.final_crc); // 应用后检查crc
       } else {
-	assert(delta.paddr.is_absolute_random_block());
-	// see prepare_record(), inplace rewrite might cause version mismatch
-	extent->apply_delta_and_adjust_crc(record_base, delta.bl);
-	extent->set_modify_time(modify_time);
-	// crc will be checked after journal replay is done
+        assert(delta.paddr.is_absolute_random_block());
+        // see prepare_record(), inplace rewrite might cause version mismatch
+        extent->apply_delta_and_adjust_crc(record_base, delta.bl);
+        extent->set_modify_time(modify_time);
+        // crc will be checked after journal replay is done
       }
 
-      extent->version++;
+      extent->version++;// 之前为0要特殊处理
       if (extent->version == 1) {
-	extent->dirty_from = journal_seq;
-        DEBUG("replayed extent delta at {} {}, become dirty -- {}, extent={}" ,
-              journal_seq, record_base, delta, *extent);
+        // 当前 extent 从哪个 Journal 位置开始依赖尚未写回的 Delta。
+        extent->dirty_from = journal_seq;
+              DEBUG("replayed extent delta at {} {}, become dirty -- {}, extent={}" ,
+                    journal_seq, record_base, delta, *extent);
       } else {
         DEBUG("replayed extent delta at {} {} -- {}, extent={}" ,
               journal_seq, record_base, delta, *extent);
       }
+      // 吧恢复的extent交个cache的dirty管理
       mark_dirty(extent);
       return replay_delta_ertr::make_ready_future<std::pair<bool, CachedExtentRef>>(
-	std::make_pair(true, extent));
+        std::make_pair(true, extent));
     });
   }
 }

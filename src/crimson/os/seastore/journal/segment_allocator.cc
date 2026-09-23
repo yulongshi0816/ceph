@@ -49,6 +49,7 @@ SegmentAllocator::do_open(bool is_mkfs)
 {
   LOG_PREFIX(SegmentAllocator::do_open);
   ceph_assert(!current_segment);
+  // 分配新的segment_seq
   segment_seq_t new_segment_seq =
     segment_seq_allocator.get_and_inc_next_segment_seq();
   auto meta = sm_group.get_meta();

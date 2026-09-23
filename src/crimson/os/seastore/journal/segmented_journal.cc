@@ -84,6 +84,7 @@ SegmentedJournal::prep_replay_segments(
     ERROR("no journal segments for replay");
     return crimson::ct_error::input_output_error::make();
   }
+  // 按照seq排序
   std::sort(
     segments.begin(),
     segments.end(),
@@ -92,6 +93,7 @@ SegmentedJournal::prep_replay_segments(
 	rt.second.segment_seq;
     });
 
+    // 设置下次的的，比如102，下次就是103
   segment_seq_allocator->set_next_segment_seq(
     segments.rbegin()->second.segment_seq + 1);
   std::for_each(
@@ -229,23 +231,25 @@ SegmentedJournal::scan_last_segment(
 
 SegmentedJournal::replay_ertr::future<>
 SegmentedJournal::replay_segment(
-  journal_seq_t seq,
-  segment_header_t header,
-  scan_delta_handler_t &handler)
+  journal_seq_t seq, // 从哪里扫描
+  segment_header_t header, // 当前segment信息
+  scan_delta_handler_t &handler) // TransactionManager 传来的 lambda
 {
   LOG_PREFIX(Journal::replay_segment);
   INFO("starting at {} -- {}", seq, header);
   return seastar::do_with(
-    scan_valid_records_cursor(seq),
+    scan_valid_records_cursor(seq), // 当前的segment和读到哪个offset了，下一个record group从哪里开始
     SegmentManagerGroup::found_record_handler_t(
+      // scanner 每找到一个有效 Record Group，就调用一次
       [&handler, this](
-      record_locator_t locator,
+      record_locator_t locator, // Journal 中哪个位置的 Record Group
       const record_group_header_t& header,
       const bufferlist& mdbuf)
       -> SegmentManagerGroup::scan_valid_records_ertr::future<>
     {
       LOG_PREFIX(Journal::replay_segment);
       ++stats.num_record_groups;
+      // 根据 Header 的结构，从 metadata buffer 中解码出这个 Record Group 里的所有 Record 和 Delta。
       auto maybe_record_deltas_list = try_decode_deltas(
           header, mdbuf, locator.record_block_base);
       if (!maybe_record_deltas_list) {
@@ -270,6 +274,7 @@ SegmentedJournal::replay_segment(
            &handler](record_deltas_t& record_deltas)
         {
           ++stats.num_records;
+          // 构造locator
           auto locator = record_locator_t{
             record_deltas.record_block_base,
             write_result
@@ -277,29 +282,32 @@ SegmentedJournal::replay_segment(
           DEBUG("processing {} deltas at block_base {}",
                 record_deltas.deltas.size(),
                 locator);
+          // 顺序处理当前Record中的所有Delta
           return crimson::do_for_each(
             record_deltas.deltas,
             [locator,
              &handler](auto &p)
           {
-	    auto& modify_time = p.first;
-	    auto& delta = p.second;
+            auto& modify_time = p.first;
+            auto& delta = p.second;
+            // cache->replay_delta
             return handler(locator, delta, modify_time).discard_result();
           });
         });
       });
     }),
     [=, this](auto &cursor, auto &dhandler) {
+      // 扫描一个segment
       return sm_group.scan_valid_records(
-	cursor,
-	header.segment_nonce,
-	std::numeric_limits<size_t>::max(),
-	dhandler
-      ).handle_error(
-	replay_ertr::pass_further{},
-	crimson::ct_error::assert_all(
-	  "shouldn't meet with any other error other replay_ertr"
-	)
+        cursor,
+    header.segment_nonce,
+        std::numeric_limits<size_t>::max(),
+        dhandler
+            ).handle_error(
+        replay_ertr::pass_further{},
+        crimson::ct_error::assert_all(
+          "shouldn't meet with any other error other replay_ertr"
+        )
       );
     }
   );
@@ -321,8 +329,15 @@ SegmentedJournal::replay_ret SegmentedJournal::replay(
 {
   LOG_PREFIX(Journal::replay);
   auto handler = std::move(delta_handler);
+  // 找到所有jouranl segment header
+  //   (device segment 4, header seq=100)
+  // (device segment 6, header seq=102)
+  // (device segment 7, header seq=101)
+  // 物理 Segment ID 不代表 Journal 时间顺序。
+  // 因为同一个segment可能被轮换使用，因此会有nonce记录一次周期，比如ABC和XYZ，如果taill是xyz那么就可能不可信
   auto segment_headers = co_await sm_group.find_journal_segment_headers();
   INFO("got {} segments", segment_headers.size());
+  // 整理出需要replay的
   co_await prep_replay_segments(std::move(segment_headers));
   alloc_map_t alloc_map;
   if (scan_alloc_on_startup) {
