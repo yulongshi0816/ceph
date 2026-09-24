@@ -2433,7 +2433,7 @@ public:
  * phy_tree_root_t
  */
 class __attribute__((packed)) phy_tree_root_t {
-  paddr_le_t root_addr;
+  paddr_le_t root_addr; // 树根位置
   depth_le_t depth = init_extent_len_le(0);
   
 public:
@@ -2671,7 +2671,7 @@ struct segment_header_t {
 
   segment_type_t type;
 
-  data_category_t category;
+  data_category_t category; // 数据还是元数据
   rewrite_gen_t generation;
 
   segment_type_t get_type() const {
@@ -2901,7 +2901,7 @@ struct record_header_t {
 std::ostream &operator<<(std::ostream&, const record_header_t&);
 
 struct record_group_header_t {
-  uint32_t      records;
+  uint32_t      records;         // 这一批有几个 Record
   extent_len_t  mdlength;       // block aligned, length of metadata
   extent_len_t  dlength;        // block aligned, length of data
   segment_nonce_t segment_nonce;// nonce of containing segment
@@ -2978,6 +2978,7 @@ struct record_group_size_t {
 std::ostream& operator<<(std::ostream&, const record_group_size_t&);
 
 struct record_group_t {
+  // 这一批有几个 Record
   std::vector<record_t> records;
   record_group_size_t size;
 

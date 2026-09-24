@@ -110,6 +110,7 @@ using LBAInternalNodeRef = LBAInternalNode::Ref;
  */
 constexpr size_t LEAF_NODE_CAPACITY = 88;
 
+//叶子节点
 struct LBALeafNode
   : FixedKVLeafNode<
       LEAF_NODE_CAPACITY,

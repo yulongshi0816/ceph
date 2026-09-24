@@ -123,6 +123,7 @@ SegmentAllocator::do_open(bool is_mkfs)
       paddr_t::make_seg_paddr(segment_id, written_to)};
     segment_provider.update_segment_avail_bytes(
         type, new_journal_seq.offset);
+    // segment 的第一个 block 存放段头，大小由 block_size 决定
     return sref->write(0, std::move(bl)
     ).handle_error(
       open_ertr::pass_further{},
