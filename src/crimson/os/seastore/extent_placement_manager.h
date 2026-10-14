@@ -461,7 +461,7 @@ public:
     return background_process.start_scan_space();
   }
 
-  void start_background() {
+  void  start_background() {
     return background_process.start_background();
   }
 

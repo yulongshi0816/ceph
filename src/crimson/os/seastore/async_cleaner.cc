@@ -1412,7 +1412,7 @@ SegmentCleaner::clean_space_ret SegmentCleaner::clean_space()
   LOG_PREFIX(SegmentCleaner::clean_space);
   assert(background_callback->is_ready());
   ceph_assert(can_clean_space());
-  if (!reclaim_state) {
+  if (!reclaim_state) { // 当前清理到哪里了的进度记录，没有就选一个新的
     segment_id_t seg_id = get_next_reclaim_segment();
     auto &segment_info = segments[seg_id];
     INFO("reclaim start... {} {}, usage={}, time_bound={}",
@@ -1852,7 +1852,7 @@ segment_id_t SegmentCleaner::get_next_reclaim_segment() const
   segment_id_t greedy_id = NULL_SEG_ID;
   double greedy_min_util = 1.0;
   for (auto& [_id, segment_info] : segments) {
-    if (segment_info.is_closed() &&
+    if (segment_info.is_closed() && // 正在写的不能选
         (trimmer == nullptr ||
          !segment_info.is_in_journal(trimmer->get_journal_tail()))) {
       // Track the configured formula's best-scoring reclaim candidate.

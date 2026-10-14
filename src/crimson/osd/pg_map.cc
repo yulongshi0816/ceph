@@ -303,6 +303,8 @@ PGMap::wait_for_pg(PGCreationBlockingEvent::TriggerI&& trigger, spg_t pgid)
     auto &state = pgs_creating.emplace(pgid, pgid).first->second;
     return make_pair(
       wait_for_pg_fut(
+      // pg创建完或者从磁盘加在完，都会用promises.set_value(pg)唤醒所有的等待者，这个时候get_shared_future就能获取到ready
+      // 如果pg创建取消了，就会收到canceled的情况
 	trigger.maybe_record_blocking(state.promise.get_shared_future(), state)
       ), state.creating);
   }

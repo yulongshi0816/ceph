@@ -886,7 +886,7 @@ ExtentPlacementManager::BackgroundProcess::run()
 {
   assert(is_running());
   while (is_running()) {
-    if (background_should_run()
+    if (background_should_run() // 当前是否有后台工作需要做，包括jouranl trim，clearn等
         || force_run_background()) {
       log_state("run(background)");
       co_await do_background_cycle();
@@ -1038,8 +1038,9 @@ ExtentPlacementManager::BackgroundProcess::do_background_cycle()
 {
   LOG_PREFIX(BackgroundProcess::do_background_cycle);
   assert(is_ready());
-  bool should_trim = trimmer->should_trim();
+  bool should_trim = trimmer->should_trim(); // 是否要trim
   bool proceed_trim = false;
+  // 可能需要的空间预算
   auto trim_size = trimmer->get_trim_size_per_cycle();
   cleaner_usage_t trim_usage{
     trim_size,
@@ -1055,6 +1056,7 @@ ExtentPlacementManager::BackgroundProcess::do_background_cycle()
 
   reserve_cleaner_result_t trim_reserve_res;
   if (should_trim) {
+    // trim过程可能要重写仍有效的内容，因此需要预留空间
     trim_reserve_res = try_reserve_cleaner(trim_usage);
     if (trim_reserve_res.is_successful()) {
       proceed_trim = true;
@@ -1084,8 +1086,10 @@ ExtentPlacementManager::BackgroundProcess::do_background_cycle()
     });
   } else {
     assert(!proceed_trim);
+    // 想要trim，但是预留空间不足，需要先clearner腾出空间
     bool should_clean_main_for_trim =
       should_trim && !trim_reserve_res.reserve_main_success;
+      // 需要clean
     bool should_clean_main =
       main_cleaner_should_run() || should_clean_main_for_trim;
     bool proceed_clean_main = false;
