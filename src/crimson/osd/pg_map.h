@@ -4,6 +4,7 @@
 #pragma once
 
 #include <map>
+#include <vector>
 #include <set>
 #include <algorithm>
 
@@ -59,6 +60,24 @@ public:
    */
   seastar::future<> set_pg_primary(spg_t pgid, bool is_primary);
 
+  /**
+   * The pg was mapped, but it does not exist on this OSD, e.g. a message
+   * for a pg this OSD left (pool size reduced, remapped) was dropped. Stop
+   * counting it in the per-core pg counts used for placement, so it does
+   * not skew the choice of core for later pgs. The mapping itself is kept,
+   * so requests in flight still route consistently.
+   */
+  seastar::future<> release_pg_count(spg_t pgid);
+
+  /// The pg was created on its mapped core; count it again if released.
+  seastar::future<> claim_pg_count(spg_t pgid);
+
+  /// Returns the released pgids (copied from shard 0).
+  seastar::future<std::vector<spg_t>> get_uncounted_pgs();
+
+  /// Remove the mapping of pgid if it is still released.
+  seastar::future<> remove_uncounted_pg_mapping(spg_t pgid);
+
   size_t get_num_pgs() const { return pg_to_core.size(); }
 
   seastar::future<> dump_store_shards(Formatter *f) const;
@@ -95,8 +114,15 @@ public:
   }
 
 private:
+  using mapping_t = std::pair<core_id_t, store_index_t>;
+  // only in shard 0
+  void count_pg(const mapping_t &mapping);
+  void uncount_pg(spg_t pgid, const mapping_t &mapping);
 
   uint32_t store_shard_nums;
+  // only in shard 0
+  // mapped pgs that do not exist here, not counted in core_to_num_pgs
+  std::set<spg_t> uncounted_pgs;
   // only in shard 0
   //<core_id, num_pgs>
   std::map<core_id_t, unsigned> core_to_num_pgs;
@@ -184,6 +210,11 @@ public:
    * Cancel pending creation of pgid.
    */
   void pg_creation_canceled(spg_t pgid);
+
+  /// true if pgid exists, or is being created or waited for, on this core
+  bool has_pg_or_creating(spg_t pgid) const {
+    return pgs.contains(pgid) || pgs_creating.contains(pgid);
+  }
 
   void remove_pg(spg_t pgid);
 
