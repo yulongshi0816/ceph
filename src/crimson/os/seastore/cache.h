@@ -757,6 +757,11 @@ public:
     return pinboard.get();
   }
 
+  /// release clean cached extents under memory pressure, returns the bytes
+  std::size_t release_clean_cache(std::size_t max_bytes) {
+    return pinboard->release_clean(max_bytes);
+  }
+
 // Interfaces only for tests.
 public:
   CachedExtentRef test_query_cache(paddr_t offset) {

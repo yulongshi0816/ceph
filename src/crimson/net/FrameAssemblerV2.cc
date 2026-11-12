@@ -397,14 +397,26 @@ FrameAssemblerV2::read_frame_payload()
                        conn, alignment, rx_segments_data.size());
       }
       uint32_t onwire_len = rx_frame_asm.get_segment_onwire_len(seg_idx);
-      // TODO: create aligned and contiguous buffer from socket
-      return read_exactly<may_cross_core>(onwire_len
-      ).then([this](auto bptr) {
-        logger().trace("{} RECV({}) frame segment[{}]",
-                       conn, bptr.length(), rx_segments_data.size());
-        bufferlist segment;
-        segment.append(std::move(bptr));
-        rx_segments_data.emplace_back(std::move(segment));
+      // Read a large segment in pieces, so that receiving a big message
+      // (e.g. a 4M write or a recovery push carrying a whole object) does
+      // not need a single contiguous allocation of the segment size, which
+      // fails once the reactor memory is fragmented or nearly full.
+      static constexpr uint32_t max_piece = 64 << 10;
+      return seastar::do_with(bufferlist(), onwire_len,
+        [this](auto &segment, auto &remaining) {
+        return seastar::do_until(
+          [&remaining] { return remaining == 0; },
+          [this, &segment, &remaining] {
+          return read_exactly<may_cross_core>(std::min(remaining, max_piece)
+          ).then([&segment, &remaining](auto bptr) {
+            remaining -= bptr.length();
+            segment.append(std::move(bptr));
+          });
+        }).then([this, &segment] {
+          logger().trace("{} RECV({}) frame segment[{}]",
+                         conn, segment.length(), rx_segments_data.size());
+          rx_segments_data.emplace_back(std::move(segment));
+        });
       });
     }
   ).then([this] {

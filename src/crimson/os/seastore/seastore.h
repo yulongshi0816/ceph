@@ -290,11 +290,22 @@ public:
       seastar::lowres_clock::duration get_onode_time{0};
       seastar::lowres_clock::duration submit_time{0};
 
+      // submit_transaction() is called, the transaction cannot be retried
+      // on an allocation failure any more
+      bool submitting = false;
+      unsigned alloc_failure_retries = 0;
+
       void reset_preserve_handle(TransactionManager &tm) {
         tm.reset_transaction_preserve_handle(*transaction);
         iter = ext_transaction.begin();
+        submitting = false;
       }
     };
+
+    /// true if the failed transaction can be retried after releasing memory
+    bool should_retry_on_alloc_failure(
+      internal_context_t &ctx,
+      std::exception_ptr eptr);
 
     seastar::future<> dispatch_collection(CollectionRef ch);
     ceph::os::Transaction build_next_batch(
@@ -690,6 +701,8 @@ public:
   private:
     std::string root;
     const uint32_t max_object_size;
+    // seastore_data_delta_based_overwrite, passed to every ObjectDataHandler
+    const extent_len_t delta_based_overwrite_max_extent_size;
     bool is_test;
 
     Device* primary_device = nullptr;
@@ -754,9 +767,10 @@ public:
   }
 
   uint64_t get_max_object_size() const override final {
+    // checked for every write op; avoid the by-name lookup
     return std::min<uint64_t>(
       crimson::common::local_conf()->osd_max_object_size,
-      crimson::common::get_conf<uint64_t>("seastore_default_max_object_size"));
+      default_max_object_size);
   }
 
   seastar::future<> write_meta(const std::string& key, const std::string& value) override;
@@ -862,6 +876,8 @@ private:
   };
   std::string root;
   MDStoreRef mdstore;
+  // seastore_default_max_object_size, read once at construction
+  const uint64_t default_max_object_size;
   Device* primary_device = nullptr; // the lowest-id device in
                                     // cache_devices or data_devices
                                     // if cache_devices is empty.

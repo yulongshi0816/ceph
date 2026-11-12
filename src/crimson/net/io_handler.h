@@ -568,6 +568,8 @@ private:
   const std::chrono::milliseconds ack_delay;
   const uint64_t ack_max_pending_msgs;
   const uint64_t ack_max_pending_bytes;
+  // crimson_osd_max_send_buffers, read when the connection is created
+  const uint64_t max_send_buffers;
 
   bool need_notify_out = false;
 

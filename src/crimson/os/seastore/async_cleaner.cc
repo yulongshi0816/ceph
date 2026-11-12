@@ -426,7 +426,11 @@ JournalTrimmerImpl::JournalTrimmerImpl(
     backend_type(type),
     roll_start(roll_start),
     roll_size(roll_size),
-    reserved_usage(0)
+    reserved_usage(0),
+    memory_pressure_trim_ratio(crimson::common::get_conf<double>(
+      "seastore_memory_pressure_trim_ratio")),
+    memory_pressure_dirty_bytes(crimson::common::get_conf<Option::size_t>(
+      "seastore_memory_pressure_dirty_bytes"))
 {
   config.validate();
   ceph_assert(roll_start >= 0);
@@ -551,7 +555,7 @@ journal_seq_t JournalTrimmerImpl::get_dirty_tail_min_target() const
   assert(background_callback->is_ready());
   auto ret = journal_head.add_offset(
       backend_type,
-      -static_cast<device_off_t>(config.min_journal_dirty_bytes),
+      -static_cast<device_off_t>(get_min_journal_dirty_bytes()),
       roll_start,
       roll_size);
   return ret;
@@ -576,7 +580,7 @@ journal_seq_t JournalTrimmerImpl::get_dirty_tail_target() const
   assert(background_callback->is_ready());
   auto ret = journal_head.add_offset(
       backend_type,
-      -static_cast<device_off_t>(config.target_journal_dirty_bytes),
+      -static_cast<device_off_t>(get_target_journal_dirty_bytes()),
       roll_start,
       roll_size);
   return ret;
@@ -600,8 +604,9 @@ journal_seq_t JournalTrimmerImpl::get_log_tail_target() const
   // to flush pending log deltas before they delay journal trimming.
   auto ret = journal_head.add_offset(
       backend_type,
-      // use dirty bytes
-      -static_cast<device_off_t>(config.target_journal_dirty_bytes / 2),
+      // use dirty bytes; shrinks with the dirty target under memory
+      // pressure so pending log deltas are flushed early as well
+      -static_cast<device_off_t>(get_target_journal_dirty_bytes() / 2),
       roll_start,
       roll_size);
   return ret;

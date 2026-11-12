@@ -335,9 +335,13 @@ using ObjectDataBlockRef = TCachedExtentRef<ObjectDataBlock>;
 
 class ObjectDataHandler {
 public:
-  ObjectDataHandler(uint32_t mos) : max_object_size(mos),
-    delta_based_overwrite_max_extent_size(
-      crimson::common::get_conf<Option::size_t>("seastore_data_delta_based_overwrite")) {}
+  ObjectDataHandler(uint32_t mos) : ObjectDataHandler(mos,
+    crimson::common::get_conf<Option::size_t>("seastore_data_delta_based_overwrite")) {}
+  // the handler is built for every read/write; hot paths pass the value
+  // cached by SeaStore::Shard instead of a by-name config lookup
+  ObjectDataHandler(uint32_t mos, extent_len_t delta_based_overwrite_max)
+    : max_object_size(mos),
+      delta_based_overwrite_max_extent_size(delta_based_overwrite_max) {}
 
   struct context_t {
     TransactionManager &tm;

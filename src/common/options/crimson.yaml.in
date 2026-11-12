@@ -309,6 +309,31 @@ options:
   level: advanced
   desc: Size in bytes of extents to keep in cache (per reactor).
   default: 2_G
+- name: seastore_memory_pressure_trim_ratio
+  type: float
+  level: advanced
+  desc: When the free memory ratio of a reactor drops below this value, trim the
+    dirty journal down to seastore_memory_pressure_dirty_bytes to release the
+    dirty extents (0 disables)
+  default: 0.3
+- name: seastore_memory_pressure_dirty_bytes
+  type: size
+  level: advanced
+  desc: The dirty journal size to trim down to under memory pressure, see
+    seastore_memory_pressure_trim_ratio
+  default: 128_M
+- name: seastore_memory_pressure_throttle_ratio
+  type: float
+  level: advanced
+  desc: When the free memory ratio of a reactor drops below this value, delay new
+    user transactions and release clean cached extents until memory is released
+    (0 disables)
+  default: 0.15
+- name: seastore_memory_pressure_throttle_max_ms
+  type: uint
+  level: advanced
+  desc: Max time in milliseconds a user transaction is delayed by memory pressure
+  default: 2000
 - name: seastore_cachepin_type
   type: str
   level: dev

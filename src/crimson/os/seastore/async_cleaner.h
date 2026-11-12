@@ -5,6 +5,7 @@
 
 #include <boost/intrusive/set.hpp>
 #include <seastar/core/condition-variable.hh>
+#include <seastar/core/memory.hh>
 #include <seastar/core/metrics_types.hh>
 
 #include "common/ceph_time.h"
@@ -22,6 +23,12 @@
 #include "crimson/os/seastore/segment_seq_allocator.h"
 
 namespace crimson::os::seastore {
+
+/// ratio of free memory in the seastar allocator of the current reactor
+inline double get_reactor_free_memory_ratio() {
+  auto st = seastar::memory::stats();
+  return static_cast<double>(st.free_memory()) / st.total_memory();
+}
 
 /*
  * segment_info_t
@@ -294,6 +301,9 @@ public:
   virtual ~ExtentCallbackInterface() = default;
 
   virtual shard_stats_t& get_shard_stats() = 0;
+
+  /// Releases clean cached extents, returns the released bytes
+  virtual std::size_t release_clean_cache(std::size_t max_bytes) = 0;
 
   /// Creates empty transaction
   /// weak transaction should be type READ
@@ -781,12 +791,36 @@ private:
       roll_start,
       roll_size);
   }
+  // Dirty extents stay pinned in memory until they are trimmed, and the
+  // dirty journal window derived from the journal size can be larger than
+  // the reactor memory (e.g. 1/3 of a 5G circular journal against 2G per
+  // reactor). Shrink the window while the reactor is short of memory.
+public:
+  bool is_under_memory_pressure() const {
+    return get_reactor_free_memory_ratio() < memory_pressure_trim_ratio;
+  }
+private:
+  std::size_t get_target_journal_dirty_bytes() const {
+    if (is_under_memory_pressure()) {
+      return std::min(config.target_journal_dirty_bytes,
+                      memory_pressure_dirty_bytes);
+    }
+    return config.target_journal_dirty_bytes;
+  }
+  std::size_t get_min_journal_dirty_bytes() const {
+    if (is_under_memory_pressure()) {
+      return std::min(config.min_journal_dirty_bytes,
+                      memory_pressure_dirty_bytes);
+    }
+    return config.min_journal_dirty_bytes;
+  }
   std::size_t get_max_dirty_bytes_to_trim() const {
     auto journal_dirty_bytes = get_journal_dirty_bytes();
-    if (journal_dirty_bytes <= config.min_journal_dirty_bytes) {
+    auto min_dirty_bytes = get_min_journal_dirty_bytes();
+    if (journal_dirty_bytes <= min_dirty_bytes) {
       return 0;
     }
-    return journal_dirty_bytes - config.min_journal_dirty_bytes;
+    return journal_dirty_bytes - min_dirty_bytes;
   }
   std::size_t get_dirty_bytes_to_trim() const {
     return std::min(get_max_dirty_bytes_to_trim(),
@@ -810,6 +844,10 @@ private:
   journal_seq_t journal_log_tail;
 
   std::size_t reserved_usage;
+
+  // see is_under_memory_pressure()
+  double memory_pressure_trim_ratio;
+  std::size_t memory_pressure_dirty_bytes;
 
   seastar::metrics::metric_group metrics;
   post_trim_callback_t _post_trim_callback;
@@ -1938,8 +1976,9 @@ public:
     // Failsafe limit: full once the used fraction reaches the same ratio
     // classic uses for its failsafe check (osd_failsafe_full_ratio, default
     // 0.97), i.e. free fraction drops below (1 - ratio).
+    // called for every write; read the legacy field directly
     const double failsafe_full_ratio =
-      crimson::common::get_conf<double>("osd_failsafe_full_ratio");
+      crimson::common::local_conf()->osd_failsafe_full_ratio;
     return st.available < st.total * (1.0 - failsafe_full_ratio);
   }
 

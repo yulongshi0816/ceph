@@ -1038,6 +1038,10 @@ public:
     return shard_stats;
   }
 
+  std::size_t release_clean_cache(std::size_t max_bytes) final {
+    return cache->release_clean_cache(max_bytes);
+  }
+
   /// weak transaction should be type READ
   TransactionRef create_transaction(
       Transaction::src_t src,
