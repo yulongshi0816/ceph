@@ -348,11 +348,13 @@ void PG::recheck_readable()
 unsigned PG::get_target_pg_log_entries() const
 {
   const unsigned local_num_pgs = shard_services.get_num_local_pgs();
+  // called for every logged write (calc_trim_to_aggressive): read the
+  // legacy fields directly instead of a by-name get_val() lookup
   const unsigned local_target =
-    local_conf().get_val<uint64_t>("osd_target_pg_log_entries_per_osd") /
+    local_conf()->osd_target_pg_log_entries_per_osd /
     seastar::this_smp_shard_count();
   const unsigned min_pg_log_entries =
-    local_conf().get_val<uint64_t>("osd_min_pg_log_entries");
+    local_conf()->osd_min_pg_log_entries;
   if (local_num_pgs > 0 && local_target > 0) {
     // target an even spread of our budgeted log entries across all
     // PGs.  note that while we only get to control the entry count
@@ -360,7 +362,7 @@ unsigned PG::get_target_pg_log_entries() const
     // primary and replica PGs (for the same pool(s) even), so this
     // will work out.
     const unsigned max_pg_log_entries =
-      local_conf().get_val<uint64_t>("osd_max_pg_log_entries");
+      local_conf()->osd_max_pg_log_entries;
     return std::clamp(local_target / local_num_pgs,
 		      min_pg_log_entries,
 		      max_pg_log_entries);

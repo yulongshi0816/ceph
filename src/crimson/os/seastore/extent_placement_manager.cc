@@ -2,6 +2,7 @@
 // vim: ts=8 sw=2 sts=2 expandtab expandtab
 
 #include <chrono>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sleep.hh>
 
 #include "crimson/os/seastore/extent_placement_manager.h"
@@ -690,6 +691,10 @@ void ExtentPlacementManager::BackgroundProcess::start_background()
   ceph_assert(trimmer->check_is_ready());
   ceph_assert(state == state_t::SCAN_SPACE);
   assert(!is_running());
+  memory_pressure_throttle_ratio = crimson::common::get_conf<double>(
+    "seastore_memory_pressure_throttle_ratio");
+  memory_pressure_throttle_max_ms = crimson::common::get_conf<uint64_t>(
+    "seastore_memory_pressure_throttle_max_ms");
   process_join = seastar::now();
   promote_process_join = seastar::now();
   state = state_t::RUNNING;
@@ -790,6 +795,49 @@ ExtentPlacementManager::BackgroundProcess::run_cleaner_until_done()
   ).finally([FNAME] {
     INFO("finished");
   });
+}
+
+seastar::future<>
+ExtentPlacementManager::BackgroundProcess::maybe_throttle_on_memory()
+{
+  if (!is_ready()) {
+    co_return;
+  }
+  if (trimmer->is_under_memory_pressure()) {
+    // let the trimmer release the dirty extents
+    maybe_wake_background();
+  }
+  if (get_reactor_free_memory_ratio() >= memory_pressure_throttle_ratio) {
+    co_return;
+  }
+  LOG_PREFIX(BackgroundProcess::maybe_throttle_on_memory);
+  DEBUG("blocked, free memory ratio {}", get_reactor_free_memory_ratio());
+  ++stats.io_blocked_count_memory;
+  auto start = seastar::lowres_clock::now();
+  // Poll instead of waiting for a wakeup: memory is also released by the
+  // cache and other users that don't notify us. The wait is bounded, so IO
+  // is not blocked forever if nothing can be released.
+  while (true) {
+    auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+      seastar::lowres_clock::now() - start).count();
+    bool timeout = static_cast<uint64_t>(waited) >=
+      memory_pressure_throttle_max_ms;
+    if (!is_ready() || timeout ||
+        get_reactor_free_memory_ratio() >= memory_pressure_throttle_ratio) {
+      stats.io_blocked_memory_ms += waited;
+      if (timeout) {
+        ++stats.io_blocked_memory_timeout;
+      }
+      DEBUG("unblocked after {}ms, timeout={}", waited, timeout);
+      co_return;
+    }
+    maybe_wake_background();
+    // The trimmer stops at its target, which can still leave the reactor
+    // below the throttle ratio. Clean extents need no IO to be released.
+    stats.memory_released_clean_bytes +=
+      extent_callback->release_clean_cache(1 << 20);
+    co_await seastar::sleep(std::chrono::milliseconds(5));
+  }
 }
 
 seastar::future<>
@@ -1268,6 +1316,18 @@ void ExtentPlacementManager::BackgroundProcess::register_metrics(store_index_t s
                      {sm::label_instance("shard_store_index", std::to_string(store_index))}),
     sm::make_counter("io_blocked_time", stats.io_blocked_time,
                      sm::description("the sum of the time(ms) in which IOs are blocked"),
+                     {sm::label_instance("shard_store_index", std::to_string(store_index))}),
+    sm::make_counter("io_blocked_count_memory", stats.io_blocked_count_memory,
+                     sm::description("IOs that are blocked by memory pressure"),
+                     {sm::label_instance("shard_store_index", std::to_string(store_index))}),
+    sm::make_counter("io_blocked_memory_ms", stats.io_blocked_memory_ms,
+                     sm::description("the sum of the time(ms) in which IOs are blocked by memory pressure"),
+                     {sm::label_instance("shard_store_index", std::to_string(store_index))}),
+    sm::make_counter("io_blocked_memory_timeout", stats.io_blocked_memory_timeout,
+                     sm::description("IOs that are unblocked by timeout under memory pressure"),
+                     {sm::label_instance("shard_store_index", std::to_string(store_index))}),
+    sm::make_counter("memory_released_clean_bytes", stats.memory_released_clean_bytes,
+                     sm::description("clean cached bytes released under memory pressure"),
                      {sm::label_instance("shard_store_index", std::to_string(store_index))})
   });
 }

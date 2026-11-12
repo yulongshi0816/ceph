@@ -96,6 +96,23 @@ public:
     do_remove_from_list(extent, nullptr);
   }
 
+  /// Evict the coldest extents until max_bytes are released or the queue
+  /// shrinks to min_size, on_release() is called with each evicted extent.
+  template <typename F>
+  std::size_t release(
+    std::size_t max_bytes,
+    std::size_t min_size,
+    F &&on_release) {
+    std::size_t released = 0;
+    while (released < max_bytes && current_size > min_size && !list.empty()) {
+      CachedExtentRef extent = &list.front();
+      released += extent->get_loaded_length();
+      do_remove_from_list(*extent, nullptr);
+      on_release(*extent);
+    }
+    return released;
+  }
+
   std::list<CachedExtentRef> add_to_top(
     CachedExtent &extent,
     const Transaction::src_t* p_src) {
@@ -595,6 +612,11 @@ public:
     }
   }
 
+  std::size_t release_clean(std::size_t max_bytes) final {
+    return lru.release(
+      max_bytes, lru.get_capacity_bytes() / 8, [](CachedExtent &) {});
+  }
+
   void clear() final {
     lru.clear();
     promoter.clear();
@@ -771,6 +793,20 @@ public:
     cache_stats_t &stats,
     bool report_detail,
     double seconds) const final;
+
+  std::size_t release_clean(std::size_t max_bytes) final {
+    auto to_fresh = [](CachedExtent &extent) {
+      extent.set_pin_state(extent_pin_state_t::Fresh);
+    };
+    // warm_in holds the extents accessed only once, release them first
+    auto released = warm_in.release(
+      max_bytes, warm_in.get_capacity_bytes() / 8, to_fresh);
+    if (released < max_bytes) {
+      released += hot.release(
+        max_bytes - released, hot.get_capacity_bytes() / 8, to_fresh);
+    }
+    return released;
+  }
 
   void remove(CachedExtent &extent) final {
     auto s = extent.get_pin_state();

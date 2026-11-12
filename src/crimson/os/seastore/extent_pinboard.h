@@ -31,6 +31,9 @@ struct ExtentPinboard {
     extent_len_t increased_length,
     const Transaction::src_t *p_src) = 0;
   virtual void clear() = 0;
+  /// Evict up to max_bytes of the coldest clean extents to release memory,
+  /// keeps a small part of the capacity, returns the released bytes.
+  virtual std::size_t release_clean(std::size_t max_bytes) = 0;
   virtual void set_background_callback(BackgroundListener *listener) = 0;
   virtual void set_extent_callback(ExtentCallbackInterface *cb) = 0;
   virtual std::size_t get_promotion_size() const = 0;

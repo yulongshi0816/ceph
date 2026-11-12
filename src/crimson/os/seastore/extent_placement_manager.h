@@ -687,7 +687,10 @@ public:
   }
 
   seastar::future<> reserve_projected_usage(io_usage_t usage) {
-    return background_process.reserve_projected_usage(usage);
+    return background_process.maybe_throttle_on_memory(
+    ).then([this, usage] {
+      return background_process.reserve_projected_usage(usage);
+    });
   }
 
   void release_projected_usage(const io_usage_t &usage) {
@@ -987,6 +990,7 @@ private:
     }
 
     void set_extent_callback(ExtentCallbackInterface *cb) {
+      extent_callback = cb;
       trimmer->set_extent_callback(cb);
       main_cleaner->set_extent_callback(cb);
       if (has_cold_tier()) {
@@ -1099,6 +1103,9 @@ private:
     }
 
     seastar::future<> reserve_projected_usage(io_usage_t usage);
+
+    // delay the user transaction while the reactor is short of memory
+    seastar::future<> maybe_throttle_on_memory();
 
     void release_projected_usage(const io_usage_t &usage) {
       if (is_ready()) {
@@ -1396,9 +1403,14 @@ private:
       uint64_t io_retried_blocked_count_clean = 0;
       uint64_t io_blocked_sum = 0;
       uint64_t io_blocked_time = 0;
+      uint64_t io_blocked_count_memory = 0;
+      uint64_t io_blocked_memory_ms = 0;
+      uint64_t io_blocked_memory_timeout = 0;
+      uint64_t memory_released_clean_bytes = 0;
     } stats;
     seastar::metrics::metric_group metrics;
 
+    ExtentCallbackInterface *extent_callback = nullptr;
     JournalTrimmerImplRef trimmer;
     AsyncCleanerRef main_cleaner;
     ExtentPinboard *pinboard = nullptr;
@@ -1422,6 +1434,9 @@ private:
     std::optional<seastar::future<>> promote_process_join;
     std::optional<seastar::promise<>> blocking_promote;
     bool is_running_until_halt = false;
+    // see maybe_throttle_on_memory()
+    double memory_pressure_throttle_ratio = 0;
+    uint64_t memory_pressure_throttle_max_ms = 0;
     state_t state = state_t::STOP;
     eviction_state_t eviction_state;
 

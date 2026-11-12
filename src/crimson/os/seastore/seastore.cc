@@ -14,6 +14,7 @@
 #include <seastar/core/fstream.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/metrics.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/shared_mutex.hh>
 
 #include "common/JSONFormatter.h"
@@ -128,6 +129,8 @@ SeaStore::Shard::Shard(
   :root(root),
    max_object_size(
      get_conf<uint64_t>("seastore_default_max_object_size")),
+   delta_based_overwrite_max_extent_size(
+     get_conf<Option::size_t>("seastore_data_delta_based_overwrite")),
    is_test(is_test),
    throttler(
       get_conf<uint64_t>("seastore_max_concurrent_transactions")),
@@ -154,7 +157,9 @@ SeaStore::SeaStore(
   const std::string& root,
   MDStoreRef mdstore)
   : root(root),
-    mdstore(std::move(mdstore))
+    mdstore(std::move(mdstore)),
+    default_max_object_size(
+      get_conf<uint64_t>("seastore_default_max_object_size"))
 {
   store_shard_nums = seastar::this_smp_shard_count();
 }
@@ -1491,7 +1496,7 @@ SeaStore::Shard::_read(
     size - offset :
     std::min(size - offset, len);
 
-  return ObjectDataHandler(max_object_size).read(
+  return ObjectDataHandler(max_object_size, delta_based_overwrite_max_extent_size).read(
     ObjectDataHandler::context_t{
       *transaction_manager,
       t,
@@ -1870,7 +1875,7 @@ SeaStore::Shard::_fiemap(
     size - off:
     std::min(size - off, len);
   return seastar::do_with(
-    ObjectDataHandler(max_object_size),
+    ObjectDataHandler(max_object_size, delta_based_overwrite_max_extent_size),
     [this, off, adjust_len, &t, &onode](auto &objhandler) {
     return objhandler.fiemap(
       ObjectDataHandler::context_t{
@@ -2018,6 +2023,38 @@ seastar::future<> SeaStore::Shard::dispatch_collection(CollectionRef ch)
   coll.collection_in_flight = false;
 }
 
+bool SeaStore::Shard::should_retry_on_alloc_failure(
+  internal_context_t &ctx,
+  std::exception_ptr eptr)
+{
+  LOG_PREFIX(SeaStoreS::should_retry_on_alloc_failure);
+  // about 5 minutes with the 100ms back off
+  constexpr unsigned MAX_RETRIES = 3000;
+  constexpr std::size_t RELEASE_BYTES = 32 << 20;
+  bool is_alloc_failure = false;
+  try {
+    std::rethrow_exception(eptr);
+  } catch (const std::bad_alloc &) {
+    is_alloc_failure = true;
+  } catch (const ceph::buffer::bad_alloc &) {
+    is_alloc_failure = true;
+  } catch (...) {
+  }
+  // Before the submission the transaction has no effect outside of itself,
+  // and the collection is still exclusively held, so the order is preserved.
+  if (!is_alloc_failure || ctx.submitting ||
+      ctx.alloc_failure_retries >= MAX_RETRIES) {
+    return false;
+  }
+  auto released = transaction_manager->release_clean_cache(RELEASE_BYTES);
+  if (ctx.alloc_failure_retries % 100 == 0) {
+    WARN("allocation failed, retry {}, released 0x{:x} bytes of clean cache",
+         ctx.alloc_failure_retries, released);
+  }
+  ++ctx.alloc_failure_retries;
+  return true;
+}
+
 seastar::future<> SeaStore::Shard::run_one_batch(
   CollectionRef _ch,
   ceph::os::Transaction&& _t)
@@ -2047,6 +2084,11 @@ seastar::future<> SeaStore::Shard::run_one_batch(
   --(shard_stats.waiting_throttler_io_num);
   ++(shard_stats.processing_inlock_io_num);
 
+  // retry the transaction which failed to allocate memory before it is
+  // submitted, see should_retry_on_alloc_failure()
+  while (true) {
+  std::exception_ptr alloc_eptr;
+  try {
   co_await with_repeat_trans_intr(
     [&, this] {
       // Preserve handle and rewind the external iterator before each attempt.
@@ -2094,6 +2136,7 @@ seastar::future<> SeaStore::Shard::run_one_batch(
       DEBUGT("completed all {} ops for cid={}",
              t, total_ops, ctx.ch->get_cid());
       auto submit_start = seastar::lowres_clock::now();
+      ctx.submitting = true;
       co_await transaction_manager->submit_transaction(*ctx.transaction);
       ctx.submit_time += seastar::lowres_clock::now() - submit_start;
     })
@@ -2104,6 +2147,15 @@ seastar::future<> SeaStore::Shard::run_one_batch(
       return seastar::now();
     })
   );
+  break;
+  } catch (...) {
+    alloc_eptr = std::current_exception();
+  }
+  if (!should_retry_on_alloc_failure(ctx, alloc_eptr)) {
+    std::rethrow_exception(alloc_eptr);
+  }
+  co_await seastar::sleep(std::chrono::milliseconds(100));
+  }
 
   DEBUGT("done", *ctx.transaction);
   add_conflict_replay_sample(ctx.transaction->get_num_replays());
@@ -2650,7 +2702,7 @@ SeaStore::Shard::_remove(
       get_omap_root(omap_type_t::XATTR, *onode));
   }).si_then([this, &ctx, &onode] {
     return seastar::do_with(
-      ObjectDataHandler(max_object_size),
+      ObjectDataHandler(max_object_size, delta_based_overwrite_max_extent_size),
       [&onode, this, &ctx](auto &objhandler)
     {
       return _maybe_copy_on_write(ctx, *onode, objhandler
@@ -2679,7 +2731,7 @@ SeaStore::Shard::_touch(
   internal_context_t &ctx,
   Onode &onode)
 {
-  auto objhandler = ObjectDataHandler(max_object_size);
+  auto objhandler = ObjectDataHandler(max_object_size, delta_based_overwrite_max_extent_size);
   co_await objhandler.touch(ObjectDataHandler::context_t{
     *transaction_manager,
     *ctx.transaction,
@@ -2714,7 +2766,7 @@ SeaStore::Shard::_write(
   }
   return seastar::do_with(
     std::move(_bl),
-    ObjectDataHandler(max_object_size),
+    ObjectDataHandler(max_object_size, delta_based_overwrite_max_extent_size),
     [=, this, &ctx, &onode](auto &bl, auto &objhandler)
   {
     return _maybe_copy_on_write(ctx, onode, objhandler
@@ -2738,7 +2790,7 @@ SeaStore::Shard::_clone(
   Onode &d_onode)
 {
   return seastar::do_with(
-    ObjectDataHandler(max_object_size),
+    ObjectDataHandler(max_object_size, delta_based_overwrite_max_extent_size),
     [this, &ctx, &onode, &d_onode](auto &objHandler)
   {
     auto &object_size = onode.get_layout().size;
@@ -2829,7 +2881,7 @@ SeaStore::Shard::_clone_range(
       std::max<uint64_t>(srcoff + length, d_object_size));
   }
   return seastar::do_with(
-    ObjectDataHandler(max_object_size),
+    ObjectDataHandler(max_object_size, delta_based_overwrite_max_extent_size),
     [=, this, &ctx](auto &objHandler) {
     return objHandler.clone_range(
       ObjectDataHandler::context_t{
@@ -2861,7 +2913,7 @@ SeaStore::Shard::_zero(
     *ctx.transaction,
     std::max<uint64_t>(offset + len, object_size));
   return seastar::do_with(
-    ObjectDataHandler(max_object_size),
+    ObjectDataHandler(max_object_size, delta_based_overwrite_max_extent_size),
     [=, this, &ctx, &onode](auto &objhandler)
   {
     return _maybe_copy_on_write(ctx, onode, objhandler
@@ -2916,7 +2968,7 @@ SeaStore::Shard::_truncate(
 {
   onode.update_onode_size(*ctx.transaction, size);
   return seastar::do_with(
-    ObjectDataHandler(max_object_size),
+    ObjectDataHandler(max_object_size, delta_based_overwrite_max_extent_size),
     [=, this, &ctx, &onode](auto &objhandler)
   {
     return _maybe_copy_on_write(ctx, onode, objhandler

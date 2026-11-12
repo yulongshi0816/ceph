@@ -60,7 +60,9 @@ IOHandler::IOHandler(ChainedDispatchers &dispatchers,
     ack_max_pending_msgs(local_conf().get_val<uint64_t>(
         "crimson_msgr_ack_max_pending_msgs")),
     ack_max_pending_bytes(local_conf().get_val<Option::size_t>(
-        "crimson_msgr_ack_max_pending_bytes"))
+        "crimson_msgr_ack_max_pending_bytes")),
+    max_send_buffers(local_conf().get_val<uint64_t>(
+        "crimson_osd_max_send_buffers"))
 {}
 
 IOHandler::~IOHandler()
@@ -83,8 +85,7 @@ IOHandler::sweep_out_pending_msgs_to_sent(
   bool require_ack)
 {
   std::size_t num_msgs = out_pending_msgs.size();
-  const unsigned max_bufs =
-      local_conf().get_val<uint64_t>("crimson_osd_max_send_buffers");
+  const unsigned max_bufs = max_send_buffers;
   ceph::bufferlist bl;
 
 #ifdef UNIT_TESTS_BUILT
